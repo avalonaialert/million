@@ -41,15 +41,18 @@ jobs:
         run: |
           python download_sp500.py --output-dir data ${{ inputs.full && '--full' || '' }} || echo "::warning::Some symbols failed to download"
 
+      - name: Generate index.html
+        run: python generate_supertrend.py --data-dir data --output index.html
+
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898208+github-actions[bot]@users.noreply.github.com"
-          git add data
+          git add data index.html
           if git diff --cached --quiet; then
             echo "No data changes to commit."
             exit 0
           fi
-          git commit -m "Update S&P 500 data ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          git commit -m "Update S&P 500 data and index.html ($(date -u +'%Y-%m-%d %H:%M UTC'))"
           git pull --rebase
           git push
