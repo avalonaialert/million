@@ -32,6 +32,8 @@ DETAIL_BARS = 180
 # Skip symbols whose data stops this many days before the newest file
 # (e.g. companies that have left the index).
 STALE_DAYS = 7
+# SMA periods (on Heikin Ashi closes) checked by the "SMA Gaining" tab.
+SMA_PERIODS = (3, 9, 20, 50, 100, 200)
 # Daily bars used to build weekly and monthly candles (~15 years).
 MTF_DAILY_BARS = 3800
 
@@ -208,6 +210,20 @@ def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return bars.dropna()
 
 
+def sma_stats(close: pd.Series, periods: tuple[int, ...]) -> tuple[dict[int, float], dict[int, float]]:
+    """(% change of each SMA on the latest bar vs the previous bar, latest SMA value)."""
+    changes, levels = {}, {}
+    for period in periods:
+        sma = close.rolling(period).mean().to_numpy()
+        changes[period] = float((sma[-1] / sma[-2] - 1) * 100) if len(sma) >= 2 else float("nan")
+        levels[period] = float(sma[-1]) if len(sma) else float("nan")
+    return changes, levels
+
+
+# SMA pairs checked for alignment (fast above slow) by the "SMA Gaining" tab.
+SMA_PAIRS = ((3, 9), (9, 20))
+
+
 @dataclass
 class MultiTimeframe:
     symbol: str
@@ -217,6 +233,23 @@ class MultiTimeframe:
     weekly: TrendStep
     monthly: TrendStep
     chart: str
+    sma_change: dict[int, float]  # % change of each SMA vs the previous day (NaN if not enough bars)
+    sma_level: dict[int, float]  # latest value of each SMA
+
+    def sma_gap(self, fast: int, slow: int) -> float:
+        """% by which the fast SMA is above (+) or below (-) the slow SMA."""
+        return (self.sma_level[fast] / self.sma_level[slow] - 1) * 100
+
+    @property
+    def sma_conditions(self) -> dict[str, bool]:
+        """Filter key -> met: g<p> = SMA p gaining, a<fast>_<slow> = fast SMA above slow SMA."""
+        out = {f"g{p}": g for p, g in self.sma_gaining.items()}
+        out.update({f"a{f}_{s}": self.sma_gap(f, s) > 0 for f, s in SMA_PAIRS})  # NaN > 0 is False
+        return out
+
+    @property
+    def sma_gaining(self) -> dict[int, bool]:
+        return {p: v > 0 for p, v in self.sma_change.items()}  # NaN > 0 is False
 
     @property
     def steps(self) -> dict[str, TrendStep]:
@@ -300,6 +333,7 @@ def analyze_frame(
             close=float(close[-1]),
             change_pct=float((close[-1] / close[-2] - 1) * 100),
             chart=mini_chart(ha, line, direction, upper, years),
+            **dict(zip(("sma_change", "sma_level"), sma_stats(ha["close"], SMA_PERIODS))),
             **steps,
         )
     if direction[-1] != 1:
@@ -391,7 +425,7 @@ def change_cell(value: float) -> str:
 
 
 def delta_cell(value: float) -> str:
-    return f'<td class="num delta" data-v="{value}">{value:+.2f}%</td>'
+    return f'<td class="num delta" data-v="{value}">{pct(value)}</td>'
 
 
 def bars_cell(bars: int, scale: int) -> str:
@@ -414,12 +448,37 @@ def row(
 TREND_LABELS = {"flat": ("Flat", -1), "new": ("New bull", -2), "bear": ("Bearish", -3), "na": ("&mdash;", -4)}
 
 
+def pct(value: float) -> str:
+    """Signed percent; tiny non-zero moves show as <0.01% instead of a misleading 0.00%."""
+    if 0 < abs(value) < 0.005:
+        return ("+" if value > 0 else "-") + "<0.01%"
+    return f"{value:+.2f}%"
+
+
+def gap_cell(gap: float) -> str:
+    """Fast SMA vs slow SMA: above ✓ (green) or below ✗ (red), with the % gap."""
+    if gap != gap:
+        return '<td class="num" data-v="-1000"><span class="tf na">&mdash;</span></td>'
+    if gap > 0:
+        return f'<td class="num" data-v="{gap}"><span class="tf up">&#10003; {pct(gap)}</span></td>'
+    return f'<td class="num" data-v="{gap}"><span class="tf bear">&#10007; {pct(gap)}</span></td>'
+
+
+def sma_cell(change: float) -> str:
+    """SMA change vs previous day: gaining ▲ (green) or falling/flat ▼ (labelled, not just colored)."""
+    if change != change:  # NaN: not enough history
+        return '<td class="num" data-v="-1000"><span class="tf na">&mdash;</span></td>'
+    if change > 0:
+        return f'<td class="num" data-v="{change}"><span class="tf up">&#9650; {pct(change)}</span></td>'
+    return f'<td class="num" data-v="{change}"><span class="tf bear">&#9660; {pct(change)}</span></td>'
+
+
 def trend_cell(step: TrendStep) -> str:
     """Supertrend change on one timeframe; non-rising states are labelled, not just colored."""
     if step.rising:
         return (
             f'<td class="num" data-v="{step.change_pct}">'
-            f'<span class="tf up">&#9650; {step.change_pct:+.2f}%</span></td>'
+            f'<span class="tf up">&#9650; {pct(step.change_pct)}</span></td>'
         )
     label, rank = TREND_LABELS[step.state]
     return f'<td class="num" data-v="{rank}"><span class="tf {step.state}">{label}</span></td>'
@@ -454,6 +513,7 @@ def pack_details(details: dict[str, dict], companies: dict[str, str]) -> dict:
 
 def render(
     signals: list[Signal], rising: list[Signal], flipped: list[Flipped], mtfs: list[MultiTimeframe],
+    smas: list[MultiTimeframe],
     details: dict[str, dict], companies: dict[str, str],
     history: dict[str, list[dict]], watched: int, total: int, bullish: int,
     as_of: str, period: int, multiplier: float, band: float,
@@ -516,6 +576,18 @@ def render(
     ]
     mtf_all = sum(all(v.rising for v in m.steps.values()) for m in mtfs)
 
+    sma_rows = [
+        row(m.symbol, companies, [
+            stock_cell(m.symbol, companies),
+            num_cell(m.close, f"{m.close:,.2f}"),
+            change_cell(m.change_pct),
+            *(sma_cell(m.sma_change[p]) for p in SMA_PERIODS),
+            *(gap_cell(m.sma_gap(f, s)) for f, s in SMA_PAIRS),
+        ], attrs="".join(f' data-{k}="{int(v)}"' for k, v in m.sma_conditions.items()))
+        for m in smas
+    ]
+    sma_all = sum(all(m.sma_conditions.values()) for m in smas)
+
     series = [{"d": day, "n": len(stocks)} for day, stocks in sorted(history.items())]
     prev = series[-2]["n"] if len(series) > 1 else None
     delta = len(signals) - prev if prev is not None else 0
@@ -542,6 +614,8 @@ def render(
         "SIGNAL_ROWS": "\n".join(signal_rows),
         "MTF_ROWS": "\n".join(mtf_rows),
         "MTF_ALL": str(mtf_all),
+        "SMA_ROWS": "\n".join(sma_rows),
+        "SMA_ALL": str(sma_all),
         # Embedded as JSON; escape "</" so it can't close the script tag.
         "DETAILS": json.dumps(pack_details(details, companies), separators=(",", ":")).replace("</", "<\\/"),
         "SYMBOL_OPTIONS": "".join(
@@ -622,7 +696,7 @@ body {
 }
 
 /* KPI tiles */
-.kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
 .kpi {
   background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
   padding: 14px 16px; text-align: left; font: inherit; color: inherit; min-width: 0;
@@ -747,7 +821,10 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 .zoom button + button { border-left: 1px solid var(--ring); }
 .zoom button:hover { background: var(--surface-2); color: var(--ink); }
 .zoom button[aria-pressed="true"] { background: var(--accent); color: #fff; }
-.dlg-chart { position: relative; height: 400px; padding: 4px 8px 12px; }
+.dlg-chart { position: relative; height: 400px; padding: 4px 8px 4px; }
+.dlg-scroll { overflow-x: auto; overflow-y: hidden; margin: 0 20px 14px 64px; height: 16px; scrollbar-color: var(--axis) transparent; }
+.dlg-scroll > div { height: 1px; }
+.dlg-scroll[hidden] { display: none; }
 .dlg-chart svg { display: block; width: 100%; height: 100%; }
 .dlg-chart svg:focus { outline: none; }
 .dlg-chart svg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
@@ -772,20 +849,20 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 .dc .mk-halo.up { stroke: var(--up); } .dc .mk-halo.down { stroke: var(--down); }
 .dc .mk-label { font-size: 10px; font-weight: 700; }
 .dc .mk-label.up { fill: var(--up); } .dc .mk-label.down { fill: var(--down); }
-.dlg-tip .t-cross { margin-top: 6px; font-weight: 600; }
-.dlg-tip .t-cross.up { color: var(--up); } .dlg-tip .t-cross.down { color: var(--down); }
 .dc .cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .dc .hl { fill: var(--ink); opacity: .05; }
-.dlg-tip {
-  position: absolute; top: 12px; pointer-events: none; background: var(--surface); border: 1px solid var(--ring);
-  border-radius: 10px; padding: 8px 12px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-size: 12px; min-width: 190px;
+.dlg-readout {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 13px; margin: 10px 20px 0; padding: 8px 12px;
+  background: var(--surface-2); border-radius: 8px; font-size: 12px;
+  min-height: 54px; align-content: center;  /* fixed height so hovering never shifts the chart */
 }
-.dlg-tip .t-date { color: var(--muted); margin-bottom: 4px; }
-.dlg-tip table { border-collapse: collapse; min-width: 0; width: 100%; }
-.dlg-tip td { padding: 1px 0; border: 0; white-space: nowrap; background: none !important; }
-.dlg-tip td:first-child { font-weight: 700; font-variant-numeric: tabular-nums; padding-right: 12px; }
-.dlg-tip td:last-child { color: var(--ink-2); }
-.dlg-tip .r { color: var(--up); }
+.dlg-readout .r-date { font-weight: 700; color: var(--ink); min-width: 92px; }
+.dlg-readout .r-item { display: inline-flex; align-items: baseline; gap: 5px; white-space: nowrap; }
+.dlg-readout .r-item span { color: var(--muted); }
+.dlg-readout .r-item b { font-variant-numeric: tabular-nums; color: var(--ink); }
+.dlg-readout .r-item b.rise { color: var(--up); }
+.dlg-readout .r-cross { font-weight: 600; }
+.dlg-readout .r-cross.up { color: var(--up); } .dlg-readout .r-cross.down { color: var(--down); }
 @media (max-width: 700px) { .dlg-chart { height: 320px; } .dlg-actions { margin-left: 0; } }
 
 @media (max-width: 900px) {
@@ -838,6 +915,11 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <div class="kpi-value">%%MTF_ALL%%</div>
       <div class="kpi-foot">Daily, weekly &amp; monthly Supertrend rising</div>
     </button>
+    <button class="kpi" data-tab="sma">
+      <div class="kpi-label">SMA Gaining</div>
+      <div class="kpi-value">%%SMA_ALL%%</div>
+      <div class="kpi-foot">All gaining, SMA 3 &gt; 9 &gt; 20</div>
+    </button>
   </section>
 
   <div class="main">
@@ -846,6 +928,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <button class="tab" role="tab" id="tab-rising" aria-controls="panel-rising" aria-selected="false" tabindex="-1">Above VWAP &middot; Rising <span class="count">%%RISING%%</span></button>
       <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Above VWAP Band <span class="count">%%COUNT%%</span></button>
       <button class="tab" role="tab" id="tab-mtf" aria-controls="panel-mtf" aria-selected="false" tabindex="-1">Multi-Timeframe Rising <span class="count" id="mtf-count">%%MTF_ALL%%</span></button>
+      <button class="tab" role="tab" id="tab-sma" aria-controls="panel-sma" aria-selected="false" tabindex="-1">SMA Gaining <span class="count" id="sma-count">%%SMA_ALL%%</span></button>
     </nav>
 
     <div>
@@ -926,7 +1009,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
         </div>
       </section>
 
-      <section class="card panel" role="tabpanel" id="panel-mtf" aria-labelledby="tab-mtf" hidden>
+      <section class="card panel" role="tabpanel" id="panel-mtf" aria-labelledby="tab-mtf" data-count="mtf-count" hidden>
         <div class="panel-head">
           <h2>Multi-Timeframe Rising</h2>
           <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
@@ -951,6 +1034,48 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
             </tr></thead>
             <tbody>
 %%MTF_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
+      </section>
+
+      <section class="card panel" role="tabpanel" id="panel-sma" aria-labelledby="tab-sma" data-count="sma-count" hidden>
+        <div class="panel-head">
+          <h2>SMA Gaining</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <fieldset class="tf-filter">
+            <legend>Gaining</legend>
+            <label><input type="checkbox" class="tf-check" value="g3" checked> SMA 3</label>
+            <label><input type="checkbox" class="tf-check" value="g9" checked> SMA 9</label>
+            <label><input type="checkbox" class="tf-check" value="g20" checked> SMA 20</label>
+            <label><input type="checkbox" class="tf-check" value="g50" checked> SMA 50</label>
+            <label><input type="checkbox" class="tf-check" value="g100" checked> SMA 100</label>
+            <label><input type="checkbox" class="tf-check" value="g200" checked> SMA 200</label>
+          </fieldset>
+          <fieldset class="tf-filter">
+            <legend>Aligned</legend>
+            <label><input type="checkbox" class="tf-check" value="a3_9" checked> SMA 3 &gt; SMA 9</label>
+            <label><input type="checkbox" class="tf-check" value="a9_20" checked> SMA 9 &gt; SMA 20</label>
+          </fieldset>
+        </div>
+        <div class="table-wrap">
+          <table data-sort="0">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="SMA 3 of Heikin Ashi close vs previous day">SMA 3</th>
+              <th class="num" data-type="num" title="SMA 9 of Heikin Ashi close vs previous day">SMA 9</th>
+              <th class="num" data-type="num" title="SMA 20 of Heikin Ashi close vs previous day">SMA 20</th>
+              <th class="num" data-type="num" title="SMA 50 of Heikin Ashi close vs previous day">SMA 50</th>
+              <th class="num" data-type="num" title="SMA 100 of Heikin Ashi close vs previous day">SMA 100</th>
+              <th class="num" data-type="num" title="SMA 200 of Heikin Ashi close vs previous day">SMA 200</th>
+              <th class="num" data-type="num" title="How far SMA 3 is above (+) or below (-) SMA 9">3 &gt; 9</th>
+              <th class="num" data-type="num" title="How far SMA 9 is above (+) or below (-) SMA 20">9 &gt; 20</th>
+            </tr></thead>
+            <tbody>
+%%SMA_ROWS%%
             </tbody>
           </table>
           <div class="empty" hidden>No stocks</div>
@@ -985,7 +1110,9 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <button type="button" data-span="40">40D</button><button type="button" data-span="90">90D</button><button type="button" data-span="180">180D</button>
     </div>
   </div>
+  <div class="dlg-readout" id="detail-readout" aria-live="polite"></div>
   <div class="dlg-chart" id="detail-chart"></div>
+  <div class="dlg-scroll" id="detail-scroll" aria-label="Scroll through dates"><div></div></div>
 </dialog>
 <script type="application/json" id="details-data">%%DETAILS%%</script>
 <script>
@@ -1057,7 +1184,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
         shown += match;
       }
       empty.hidden = shown > 0;
-      if (tfChecks.length) document.getElementById("mtf-count").textContent = shown;
+      if (panel.dataset.count) document.getElementById(panel.dataset.count).textContent = shown;
     }
     search.addEventListener("input", filter);
     if (freshOnly) freshOnly.addEventListener("change", filter);
@@ -1086,7 +1213,10 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
   const chartHost = document.getElementById("detail-chart");
   const NS = "http://www.w3.org/2000/svg";
   let openSym = null;
-  let span = 40;  // visible candles; the window always ends at the latest candle
+  let span = 40;  // visible candles
+  let end = 0;     // index just past the last visible candle (n = showing the latest)
+  const scroller = document.getElementById("detail-scroll");
+  let syncingScroll = false;
   const MIN_SPAN = 20;
   const zoomButtons = [...document.querySelectorAll(".zoom button")];
 
@@ -1098,7 +1228,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
   }
   const money = v => v == null ? "—" : v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
   const shortDate = d => new Date(d + "T12:00:00").toLocaleDateString(undefined, {month: "short", day: "numeric"});
-  const longDate = d => new Date(d + "T12:00:00").toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric", year: "numeric"});
+  const longDate = d => new Date(d + "T12:00:00").toLocaleDateString(undefined, {month: "short", day: "numeric", year: "numeric"});
   function niceStep(span, target) {
     const raw = span / target, mag = Math.pow(10, Math.floor(Math.log10(raw)));
     for (const m of [1, 2, 2.5, 5, 10]) if (m * mag >= raw) return m * mag;
@@ -1117,6 +1247,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     chg.className = "pill " + (b.chg >= 0 ? "up" : "down");
     document.getElementById("detail-link").href = "https://finance.yahoo.com/quote/" + encodeURIComponent(sym);
     span = Math.min(40, b.d.length);
+    end = b.d.length;
     dlg.showModal();
     drawDetail();
     return true;
@@ -1127,12 +1258,13 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     chartHost.textContent = "";
     const n = b.d.length;
     span = Math.max(Math.min(span, n), Math.min(MIN_SPAN, n));
-    const start = n - span;
+    end = Math.max(span, Math.min(n, end));
+    const start = end - span;
     zoomButtons.forEach(z => z.setAttribute("aria-pressed", Number(z.dataset.span) === span));
     const W = chartHost.clientWidth - 16, H = chartHost.clientHeight - 16;
     const pad = {l: 56, r: 92, t: 12, b: 26};
     const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b, step = iw / span;
-    const all = [b.h, b.l, b.st, b.s3, b.s9, b.up, b.vw].flatMap(a => a.slice(start)).filter(v => v != null);
+    const all = [b.h, b.l, b.st, b.s3, b.s9, b.up, b.vw].flatMap(a => a.slice(start, end)).filter(v => v != null);
     let lo = Math.min(...all), hi = Math.max(...all);
     const margin = (hi - lo) * 0.04 || 1; lo -= margin; hi += margin;
     const x = i => pad.l + (i - start + 0.5) * step;
@@ -1146,7 +1278,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       el("line", {x1: pad.l, x2: W - pad.r, y1: y(v), y2: y(v), class: "grid"}, svg);
       el("text", {x: pad.l - 8, y: y(v) + 4, "text-anchor": "end", class: "tick"}, svg).textContent = money(v);
     }
-    for (let i = start; i < n; i += Math.ceil(span / 6)) {
+    for (let i = start; i < end; i += Math.ceil(span / 6)) {
       el("text", {x: x(i), y: H - 6, "text-anchor": "middle", class: "tick"}, svg).textContent = shortDate(b.d[i]);
     }
     const hl = el("rect", {y: pad.t, height: ih, width: step, class: "hl", visibility: "hidden"}, svg);
@@ -1154,7 +1286,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     // VWAP band (restarts each January, so break at a year change)
     const sameYear = i => b.d[i].slice(0, 4) === b.d[i - 1].slice(0, 4);
     let runs = [], cur = [];
-    for (let i = start; i < n; i++) {
+    for (let i = start; i < end; i++) {
       if (b.up[i] == null || b.vw[i] == null || (i > start && !sameYear(i))) { if (cur.length) runs.push(cur); cur = []; }
       if (b.up[i] != null && b.vw[i] != null) cur.push(i);
     }
@@ -1169,7 +1301,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     // Heikin Ashi candles
     const cg = el("g", {class: "candles"}, svg);
     const bw = Math.max(step * 0.6, 1.5);
-    for (let i = start; i < n; i++) {
+    for (let i = start; i < end; i++) {
       const cls = b.c[i] >= b.o[i] ? "c-up" : "c-down";
       const top = y(Math.max(b.o[i], b.c[i])), bottom = y(Math.min(b.o[i], b.c[i]));
       el("line", {x1: x(i), x2: x(i), y1: y(b.h[i]), y2: y(b.l[i]), class: cls, "stroke-width": 1}, cg);
@@ -1179,7 +1311,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     // Lines: each segment green when the value rose from the previous candle, gray otherwise.
     function segments(values, width, breakAt) {
       const paths = {rise: "", flat: ""};
-      for (let i = start + 1; i < n; i++) {
+      for (let i = start + 1; i < end; i++) {
         if (values[i] == null || values[i - 1] == null || (breakAt && breakAt(i))) continue;
         const kind = values[i] > values[i - 1] ? "rise" : "flat";
         paths[kind] += `M${x(i - 1)},${y(values[i - 1])}L${x(i)},${y(values[i])}`;
@@ -1193,7 +1325,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     // Supertrend crossing the VWAP upper band. Ignore Supertrend flips (the line jumps
     // between bands) and the January VWAP reset, which aren't real crossings.
     const crossings = {};
-    for (let i = start + 1; i < n; i++) {
+    for (let i = start + 1; i < end; i++) {
       const s0 = b.st[i - 1], s1 = b.st[i], u0 = b.up[i - 1], u1 = b.up[i];
       if ([s0, s1, u0, u1].some(v => v == null) || b.dir[i] !== b.dir[i - 1] || !sameYear(i)) continue;
       const d0 = s0 - u0, d1 = s1 - u1;
@@ -1210,7 +1342,8 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     }
 
     // Right-edge labels, nudged apart so they never overlap
-    const last = n - 1;
+    const last = end - 1;
+    syncScrollbar(n, start);
     const labels = [["Supertrend", b.st[last]], ["SMA 3", b.s3[last]], ["SMA 9", b.s9[last]], ["VWAP band", b.up[last]]]
       .filter(([, v]) => v != null).map(([t, v]) => ({t, y: y(v)})).sort((a, c) => a.y - c.y);
     for (let k = 1; k < labels.length; k++) labels[k].y = Math.max(labels[k].y, labels[k - 1].y + 13);
@@ -1218,50 +1351,50 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 
     // Crosshair + readout
     const cross = el("line", {y1: pad.t, y2: pad.t + ih, class: "cross", visibility: "hidden"}, svg);
-    const tip = document.createElement("div");
-    tip.className = "dlg-tip"; tip.hidden = true;
-    chartHost.appendChild(tip);
+    const readout = document.getElementById("detail-readout");
     let idx = last;
-    function rows(i) {
+    function items(i) {
       const up = (arr, extra) => i > 0 && arr[i] != null && arr[i - 1] != null && arr[i] > arr[i - 1] && (!extra || extra());
       return [
-        [money(b.c[i]), "HA close"],
-        [`${money(b.o[i])} / ${money(b.h[i])} / ${money(b.l[i])}`, "open / high / low"],
-        [money(b.st[i]), "Supertrend", up(b.st, () => b.dir[i] === b.dir[i - 1])],
-        [money(b.s3[i]), "SMA 3", up(b.s3)],
-        [money(b.s9[i]), "SMA 9", up(b.s9)],
-        [money(b.up[i]), "VWAP band"],
-        [money(b.vw[i]), "VWAP"],
+        ["O", money(b.o[i])], ["H", money(b.h[i])], ["L", money(b.l[i])], ["C", money(b.c[i])],
+        ["Supertrend", money(b.st[i]), up(b.st, () => b.dir[i] === b.dir[i - 1])],
+        ["SMA 3", money(b.s3[i]), up(b.s3)],
+        ["SMA 9", money(b.s9[i]), up(b.s9)],
+        ["VWAP band", money(b.up[i])],
+        ["VWAP", money(b.vw[i])],
       ];
+    }
+    // The strip shows the hovered candle, or the latest candle when not hovering.
+    function render(i) {
+      readout.textContent = "";
+      const date = document.createElement("span");
+      date.className = "r-date";
+      date.textContent = longDate(b.d[i]);
+      readout.append(date);
+      for (const [label, value, rising] of items(i)) {
+        const item = document.createElement("span"), l = document.createElement("span"), v = document.createElement("b");
+        item.className = "r-item";
+        l.textContent = label;
+        v.textContent = value + (rising ? " \u25B2" : "");
+        if (rising) v.className = "rise";
+        item.append(l, v);
+        readout.append(item);
+      }
+      if (crossings[i]) {
+        const note = document.createElement("span");
+        note.className = "r-cross " + crossings[i];
+        note.textContent = crossings[i] === "up" ? "\u25B2 Crossed above band" : "\u25BC Crossed below band";
+        readout.append(note);
+      }
     }
     function show(i) {
       idx = Math.max(start, Math.min(last, i));
       cross.setAttribute("x1", x(idx)); cross.setAttribute("x2", x(idx)); cross.setAttribute("visibility", "visible");
       hl.setAttribute("x", x(idx) - step / 2); hl.setAttribute("visibility", "visible");
-      tip.textContent = "";
-      const date = document.createElement("div"); date.className = "t-date"; date.textContent = longDate(b.d[idx]);
-      const table = document.createElement("table");
-      for (const [value, label, rising] of rows(idx)) {
-        const tr = table.insertRow();
-        const a = tr.insertCell(), c = tr.insertCell();
-        a.textContent = value + (rising ? " ▲" : "");
-        if (rising) a.className = "r";
-        c.textContent = label;
-      }
-      tip.append(date, table);
-      if (crossings[idx]) {
-        const note = document.createElement("div");
-        note.className = "t-cross " + crossings[idx];
-        note.textContent = crossings[idx] === "up" ? "\u25B2 Supertrend crossed above VWAP band" : "\u25BC Supertrend crossed below VWAP band";
-        tip.append(note);
-      }
-      tip.hidden = false;
-      // Keep the readout on the side away from the pointer.
-      const onLeft = x(idx) > W / 2;
-      tip.style.left = onLeft ? (pad.l + 16) + "px" : "auto";
-      tip.style.right = onLeft ? "auto" : (pad.r + 24) + "px";
+      render(idx);
     }
-    function hide() { cross.setAttribute("visibility", "hidden"); hl.setAttribute("visibility", "hidden"); tip.hidden = true; }
+    function hide() { cross.setAttribute("visibility", "hidden"); hl.setAttribute("visibility", "hidden"); render(last); }
+    render(last);
     svg.addEventListener("pointermove", e => {
       const r = svg.getBoundingClientRect();
       show(start + Math.floor(((e.clientX - r.left) * (W / r.width) - pad.l) / step));
@@ -1287,11 +1420,46 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     next = Math.max(Math.min(MIN_SPAN, n), Math.min(n, Math.round(next)));
     if (next !== span) { span = next; drawDetail(); }
   }
+  function panTo(nextEnd) {
+    if (!openSym) return;
+    const n = getDetail(openSym).d.length;
+    nextEnd = Math.max(span, Math.min(n, Math.round(nextEnd)));
+    if (nextEnd !== end) { end = nextEnd; drawDetail(); }
+  }
+  // Scrollbar width mirrors the zoom: thumb = visible part of the history.
+  function syncScrollbar(n, start) {
+    scroller.hidden = span >= n;
+    if (scroller.hidden) return;
+    scroller.firstElementChild.style.width = (scroller.clientWidth * n / span) + "px";
+    syncingScroll = true;
+    scroller.scrollLeft = (start / (n - span)) * (scroller.scrollWidth - scroller.clientWidth);
+    requestAnimationFrame(() => { syncingScroll = false; });
+  }
+  let scrollFrame = 0;
+  scroller.addEventListener("scroll", () => {
+    if (syncingScroll || !openSym) return;
+    cancelAnimationFrame(scrollFrame);
+    scrollFrame = requestAnimationFrame(() => {
+      const n = getDetail(openSym).d.length;
+      const room = scroller.scrollWidth - scroller.clientWidth;
+      panTo(span + (room > 0 ? scroller.scrollLeft / room : 1) * (n - span));
+    });
+  });
   zoomButtons.forEach(z => z.addEventListener("click", () => zoomTo(Number(z.dataset.span))));
-  // Mouse wheel / trackpad pinch: scroll down or pinch in to zoom out, up or pinch out to zoom in.
+  // Mouse wheel up/down or trackpad pinch zooms (keeping the right edge in place).
+  // Sideways swipe or Shift + wheel pans through dates.
+  let panCarry = 0;
   chartHost.addEventListener("wheel", e => {
     e.preventDefault();
-    zoomTo(span * Math.pow(1.0015, e.deltaY * (e.ctrlKey ? 4 : 1)));
+    const sideways = e.shiftKey ? e.deltaY || e.deltaX : e.deltaX;
+    if (Math.abs(sideways) > Math.abs(e.shiftKey ? 0 : e.deltaY)) {
+      const barWidth = chartHost.clientWidth / span;
+      panCarry += sideways / Math.max(barWidth, 1);
+      const bars = Math.trunc(panCarry);
+      if (bars) { panCarry -= bars; panTo(end + bars); }
+    } else {
+      zoomTo(span * Math.pow(1.0015, e.deltaY * (e.ctrlKey ? 4 : 1)));
+    }
   }, {passive: false});
   document.getElementById("detail-close-btn").addEventListener("click", () => dlg.close());
 
@@ -1443,16 +1611,20 @@ def backfill(files: list[Path], days: int, args: argparse.Namespace) -> None:
     print(f"Backfilled {len(filled)} trading days ({trading_days[0]} to {trading_days[-1]}) -> {args.signals_file}")
 
 
-ALERT_LISTS = {"flipped": "Bullish Re-entry", "dwm": "Multi-Timeframe Rising", "above": "Above VWAP Band"}
+ALERT_LISTS = {
+    "flipped": "Bullish Re-entry",
+    "dwm": "Multi-Timeframe Rising",
+    "above": "Above VWAP Band",
+    "sma": "SMA Gaining",
+}
 
 
 def update_alerts(
     lists: dict[str, list[str]], state_path: Path, alert_path: Path | None,
     details: dict[str, dict], companies: dict[str, str], as_of: str,
 ) -> dict[str, list[str]]:
-    """Save this run's lists and, if a previous run's lists exist, write a Markdown alert
-    for symbols that weren't in them. The alert's first line is the issue title.
-    Returns {list key: new symbols}."""
+    """Save this run's lists and, if a previous run's lists exist, write an alert email
+    (see write_alert_email) for symbols that weren't in them. Returns {list key: new symbols}."""
     previous = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else None
     state_path.write_text(json.dumps({"as_of": as_of, "lists": lists}, indent=2) + "\n", encoding="utf-8")
     if previous is None:
@@ -1465,27 +1637,55 @@ def update_alerts(
     if not alert_path or not any(new.values()):
         return new
 
-    now = datetime.now(ZoneInfo("America/New_York"))
+    write_alert_email(new, alert_path, details, companies, as_of)
+    return new
+
+
+def write_alert_email(
+    new: dict[str, list[str]], path: Path, details: dict[str, dict], companies: dict[str, str], as_of: str
+) -> None:
+    """Write the alert email: <path> (plain text, first line = subject) and <path>.html."""
+    now = datetime.now(ZoneInfo("America/New_York")).strftime("%-I:%M %p %Z")
     counts = ", ".join(f"{len(syms)} {ALERT_LISTS[key]}" for key, syms in new.items() if syms)
-    lines = [
-        f"New signals {as_of}: {counts}",
-        "",
-        f"Data as of **{as_of}** · run at {now.strftime('%-I:%M %p %Z')}. "
-        "Stocks below were not in these lists on the previous run.",
+    subject = f"New signals {as_of}: {counts}"
+    intro = f"Data as of {as_of}, run at {now}. These stocks were not in the lists on the previous run."
+
+    text = [subject, "", intro]
+    parts = [
+        '<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1d1d1b;max-width:640px">',
+        f'<h2 style="font-size:18px;margin:0 0 4px">{html.escape(subject)}</h2>',
+        f'<p style="color:#6b6b66;font-size:13px;margin:0 0 16px">{html.escape(intro)}</p>',
     ]
     for key, syms in new.items():
         if not syms:
             continue
-        lines += ["", f"### {ALERT_LISTS[key]} ({len(syms)} new)", "",
-                  "| Symbol | Company | Close | Day |", "|---|---|---:|---:|"]
+        title = f"{ALERT_LISTS[key]} ({len(syms)} new)"
+        text += ["", title]
+        parts += [
+            f'<h3 style="font-size:15px;margin:20px 0 6px">{html.escape(title)}</h3>',
+            '<table cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px;width:100%">',
+            '<tr style="text-align:left;color:#6b6b66;border-bottom:1px solid #e4e4df">'
+            '<th>Symbol</th><th>Company</th><th style="text-align:right">Close</th><th style="text-align:right">Day</th></tr>',
+        ]
         for sym in syms:
-            det = details.get(sym, {})
-            name = companies.get(sym, "").replace("|", "\\|")
+            det = details.get(sym)
+            name = companies.get(sym, "")
             close = f"{det['close']:,.2f}" if det else ""
             chg = f"{det['chg']:+.2f}%" if det else ""
-            lines.append(f"| [{sym}](https://finance.yahoo.com/quote/{sym}) | {name} | {close} | {chg} |")
-    alert_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return new
+            color = "#1f9d5c" if det and det["chg"] >= 0 else "#d0473d"
+            text.append(f"  {sym:<6} {name[:32]:<32} {close:>10} {chg:>8}")
+            parts.append(
+                '<tr style="border-bottom:1px solid #f0efec">'
+                f'<td><a href="https://finance.yahoo.com/quote/{html.escape(sym)}" '
+                f'style="color:#2a78d6;font-weight:700;text-decoration:none">{html.escape(sym)}</a></td>'
+                f"<td>{html.escape(name)}</td>"
+                f'<td style="text-align:right">{close}</td>'
+                f'<td style="text-align:right;color:{color};font-weight:600">{chg}</td></tr>'
+            )
+        parts.append("</table>")
+    parts.append("</div>")
+    path.write_text("\n".join(text) + "\n", encoding="utf-8")
+    path.with_suffix(".html").write_text("\n".join(parts) + "\n", encoding="utf-8")
 
 
 def main() -> int:
@@ -1510,7 +1710,7 @@ def main() -> int:
     parser.add_argument(
         "--alert-file",
         type=Path,
-        help="write a Markdown alert here when stocks newly join Bullish Re-entry, Multi-Timeframe Rising or Above VWAP Band",
+        help="write an alert email here (plain text, plus .html) when stocks newly join Bullish Re-entry, Multi-Timeframe Rising, Above VWAP Band or SMA Gaining",
     )
     parser.add_argument(
         "--backfill",
@@ -1559,8 +1759,12 @@ def main() -> int:
     )
     # Chart data for every current stock, so the lookup box can chart any symbol.
     details = {r.detail["sym"]: r.detail for r in current if r.detail}
+    # Stocks meeting at least one SMA condition; the page filters further.
+    smas = sorted(
+        (r.mtf for r in current if r.mtf and any(r.mtf.sma_conditions.values())), key=lambda m: m.symbol
+    )
     page = render(
-        signals, rising, flipped, mtfs, details, companies, history, watched, len(current), bullish,
+        signals, rising, flipped, mtfs, smas, details, companies, history, watched, len(current), bullish,
         as_of, args.period, args.multiplier, args.vwap_band,
     )
     args.output.write_text(page, encoding="utf-8")
@@ -1569,6 +1773,8 @@ def main() -> int:
         "flipped": sorted(f.signal.symbol for f in flipped),
         "dwm": [m.symbol for m in mtfs if all(v.rising for v in m.steps.values())],
         "above": sorted(s.symbol for s in signals),
+        # SMA Gaining with its default filters: all six SMAs gaining and SMA 3 > 9 > 20.
+        "sma": [m.symbol for m in smas if all(m.sma_conditions.values())],
     }
     new = update_alerts(
         lists, args.data_dir / "alerts_state.json", args.alert_file, details, companies, as_of

@@ -15,7 +15,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: update-data
@@ -43,19 +42,7 @@ jobs:
           python download_sp500.py --output-dir data ${{ inputs.full && '--full' || '' }} || echo "::warning::Some symbols failed to download"
 
       - name: Generate index.html
-        run: python generate_supertrend.py --data-dir data --output index.html --alert-file "$RUNNER_TEMP/alert.md"
-
-      - name: Open an issue for new signals
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # alert.md is only written when a stock newly joined a list; its first line is the title.
-          if [ -s "$RUNNER_TEMP/alert.md" ]; then
-            tail -n +3 "$RUNNER_TEMP/alert.md" > "$RUNNER_TEMP/alert-body.md"
-            gh issue create --title "$(head -n 1 "$RUNNER_TEMP/alert.md")" --body-file "$RUNNER_TEMP/alert-body.md"
-          else
-            echo "No new signals."
-          fi
+        run: python generate_supertrend.py --data-dir data --output index.html --alert-file "$RUNNER_TEMP/alert.txt"
 
       - name: Commit and push changes
         run: |
@@ -71,3 +58,13 @@ jobs:
           git commit -m "Update S&P 500 data and index.html ($(date -u +'%Y-%m-%d %H:%M UTC'))"
           git pull --rebase
           git push
+
+      - name: Email new signals
+        # Runs after the push so a mail problem never blocks the data update,
+        # and still runs if the push itself failed.
+        if: ${{ !cancelled() }}
+        env:
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python send_alert_email.py "$RUNNER_TEMP/alert.txt"
