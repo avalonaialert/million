@@ -2,10 +2,11 @@ name: Update S&P 500 data
 
 on:
   schedule:
-    # GitHub cron runs in UTC. 17:00 UTC = 12:00 PM EST, 22:00 UTC = 5:00 PM EST.
-    # (During daylight saving time these fire at 1:00 PM and 6:00 PM Eastern.)
-    - cron: "0 17 * * *"
-    - cron: "0 22 * * *"
+    # Weekdays at 10 AM, 12 PM, 3 PM and 5 PM US Eastern. GitHub cron is UTC-only, so both
+    # the standard-time and daylight-time UTC hours are listed; the "eastern-time" job
+    # below lets through only the set that matches New York's current offset.
+    - cron: "0 15,17,20,22 * * 1-5"  # EST (UTC-5): 10 AM, 12 PM, 3 PM, 5 PM
+    - cron: "0 14,16,19,21 * * 1-5"  # EDT (UTC-4): 10 AM, 12 PM, 3 PM, 5 PM
   workflow_dispatch: # on-demand run from the Actions tab
     inputs:
       full:
@@ -21,7 +22,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  eastern-time:
+    # Decide whether this scheduled run is the one for New York's current offset.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          zone=$(TZ=America/New_York date +%Z)   # EST or EDT
+          case "$SCHEDULE" in
+            "0 15,17,20,22 * * 1-5") want=EST ;;
+            "0 14,16,19,21 * * 1-5") want=EDT ;;
+            *) want="" ;;
+          esac
+          if [ "$EVENT" != "schedule" ] || [ "$zone" = "$want" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping: this is the $want schedule but New York is on $zone."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   update:
+    needs: eastern-time
+    if: needs.eastern-time.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
