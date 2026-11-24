@@ -1,15 +1,19 @@
 {
-  "as_of": "2026-11-23",
+  "as_of": "2026-11-24",
   "lists": {
     "flipped": [
+      "AIZ",
       "DGX",
-      "LH"
+      "LH",
+      "TGT"
     ],
     "dwm": [
+      "AIZ",
       "BIIB",
       "DGX",
       "GILD",
-      "LH"
+      "LH",
+      "TGT"
     ],
     "above": [
       "A",
@@ -39,7 +43,6 @@
       "FAST",
       "FDS",
       "GILD",
-      "GWW",
       "HAS",
       "HLT",
       "KO",
@@ -61,6 +64,7 @@
       "RVTY",
       "SJM",
       "SWK",
+      "TGT",
       "TRV",
       "TYL",
       "V",
@@ -71,10 +75,18 @@
       "WST"
     ],
     "sma": [
+      "BIIB",
       "DGX",
+      "GILD",
+      "MAS",
+      "MRSH",
       "TGT",
-      "WRB"
+      "VRSN",
+      "WRB",
+      "ZBH"
     ],
-    "rsi": []
+    "rsi": [
+      "DGX"
+    ]
   }
 }
