@@ -1,0 +1,55 @@
+name: Update S&P 500 data
+
+on:
+  schedule:
+    # GitHub cron runs in UTC. 17:00 UTC = 12:00 PM EST, 22:00 UTC = 5:00 PM EST.
+    # (During daylight saving time these fire at 1:00 PM and 6:00 PM Eastern.)
+    - cron: "0 17 * * *"
+    - cron: "0 22 * * *"
+  workflow_dispatch: # on-demand run from the Actions tab
+    inputs:
+      full:
+        description: "Re-download full history for every symbol"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download data
+        # The script exits non-zero if any single symbol fails; still commit
+        # whatever downloaded successfully.
+        run: |
+          python download_sp500.py --output-dir data ${{ inputs.full && '--full' || '' }} || echo "::warning::Some symbols failed to download"
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898208+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+          git commit -m "Update S&P 500 data ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+          git pull --rebase
+          git push
