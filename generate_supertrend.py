@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -62,6 +62,7 @@ class Signal:
     bars_in_trend: int
     change_pct: float
     chart: str
+    streak: dict[str, int] = field(default_factory=dict)  # tab key -> trading days in the list
 
 
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
@@ -245,6 +246,46 @@ def rsi_stats(close: np.ndarray) -> tuple[float, float]:
     return float(values[-1]), float(ma[-1])
 
 
+def rising_flags(values: np.ndarray, direction: np.ndarray | None = None) -> np.ndarray:
+    """Per bar: value higher than the previous bar (and, with a direction, bullish on both bars)."""
+    prev = np.concatenate(([np.nan], values[:-1]))
+    up = values > prev  # NaN compares False
+    if direction is not None:
+        prev_dir = np.concatenate(([0], direction[:-1]))
+        up &= (direction == 1) & (prev_dir == 1)
+    return up
+
+
+def streak(flags: np.ndarray) -> int:
+    """Number of consecutive True values ending at the latest bar (0 if the latest is False)."""
+    falses = np.flatnonzero(~np.asarray(flags, dtype=bool))
+    return int(len(flags) - (falses[-1] + 1)) if len(falses) else int(len(flags))
+
+
+def map_to_days(dates: np.ndarray, period_flags: dict[str, bool], weekly: bool) -> np.ndarray:
+    """Spread weekly ("YYYY-MM-DD" Friday labels) or monthly ("YYYY-MM") flags onto daily dates.
+    Past days use their period's final value; the current period is still in progress."""
+    if weekly:
+        days = pd.to_datetime(pd.Series(dates))
+        labels = (days + pd.to_timedelta((4 - days.dt.day_of_week) % 7, unit="D")).dt.strftime("%Y-%m-%d")
+    else:
+        labels = pd.Series(dates).str[:7]
+    return np.array([period_flags.get(label, False) for label in labels], dtype=bool)
+
+
+def sma_condition_flags(close: pd.Series) -> np.ndarray:
+    """Per bar: every SMA gaining vs the previous bar and every SMA pair stacked (fast > slow) —
+    the SMA Gaining tab's default filters. False where there isn't enough history."""
+    smas = {p: close.rolling(p).mean().to_numpy() for p in SMA_PERIODS}
+    met = np.ones(len(close), dtype=bool)
+    for values in smas.values():
+        prev = np.concatenate(([np.nan], values[:-1]))
+        met &= values > prev  # NaN compares False
+    for fast, slow in SMA_PAIRS:
+        met &= smas[fast] > smas[slow]
+    return met
+
+
 def sma_stats(close: pd.Series, periods: tuple[int, ...]) -> tuple[dict[int, float], dict[int, float]]:
     """(% change of each SMA on the latest bar vs the previous bar, latest SMA value)."""
     changes, levels = {}, {}
@@ -271,6 +312,7 @@ class MultiTimeframe:
     sma_change: dict[int, float]  # % change of each SMA vs the previous day (NaN if not enough bars)
     sma_level: dict[int, float]  # latest value of each SMA
     rsi: dict[str, float]  # "d"/"w"/"m": RSI on daily/weekly/monthly Heikin Ashi close; "<tf>_ma": SMA of that RSI
+    streak: dict[str, int] = field(default_factory=dict)  # tab key -> trading days in the list
 
     @property
     def rsi_conditions(self) -> dict[str, bool]:
@@ -371,13 +413,15 @@ def analyze_frame(
         recent = full.tail(MTF_DAILY_BARS)
         tf_close = {"weekly": np.array([]), "monthly": np.array([])}
         tf_rsi = {}  # "weekly"/"monthly" -> {period label: (RSI, SMA of RSI)} for the pop-up chart
+        tf_flags = {}  # "weekly"/"monthly" -> {"st": {label: rising}, "rsi": {label: RSI > 70 and > SMA}}
         for name, rule in (("weekly", "W-FRI"), ("monthly", "ME")):
             bars = resample(recent, rule)
             if len(bars) < period + 2:
                 steps[name] = TrendStep("na")
                 continue
             ha_tf = heikin_ashi(bars)
-            steps[name] = trend_step(*supertrend(ha_tf, period, multiplier))
+            line_tf, dir_tf = supertrend(ha_tf, period, multiplier)
+            steps[name] = trend_step(line_tf, dir_tf)
             tf_close[name] = ha_tf["close"].to_numpy()
             values = rsi(tf_close[name])
             ma = pd.Series(values).rolling(RSI_MA_PERIOD).mean().to_numpy()
@@ -387,6 +431,10 @@ def analyze_frame(
                 label.strftime(fmt): (values[k], ma[k])
                 for k, label in list(enumerate(bars.index))[-keep:]
             }
+            labels = [label.strftime(fmt) for label in bars.index]
+            st_up = rising_flags(line_tf, dir_tf)
+            rsi_ok = (values > RSI_LEVEL) & (values > ma)
+            tf_flags[name] = {"st": dict(zip(labels, st_up)), "rsi": dict(zip(labels, rsi_ok))}
         nan2 = (float("nan"), float("nan"))
         rsi_d, rsi_d_ma = rsi_stats(ha["close"].to_numpy())
         rsi_w, rsi_w_ma = rsi_stats(tf_close["weekly"]) if len(tf_close["weekly"]) else nan2
@@ -394,10 +442,29 @@ def analyze_frame(
         daily_rsi = rsi(ha["close"].to_numpy())
         detail["rd"] = rounded(daily_rsi[-DETAIL_BARS:])
         detail["rdm"] = rounded(pd.Series(daily_rsi).rolling(RSI_MA_PERIOD).mean().to_numpy()[-DETAIL_BARS:])
+        detail["sg"] = "".join("1" if v else "0" for v in sma_condition_flags(ha["close"])[-DETAIL_BARS:])
         detail["rw"] = tf_rsi.get("weekly", {})
         detail["rm"] = tf_rsi.get("monthly", {})
+        # Days in each tab's list (its default filters), counted back from today.
+        st_up = rising_flags(line, direction)
+        above = (direction == 1) & (line > upper)
+        daily_rsi_ma = pd.Series(daily_rsi).rolling(RSI_MA_PERIOD).mean().to_numpy()
+        tf_day = {
+            (name, kind): map_to_days(dates, tf_flags.get(name, {}).get(kind, {}), name == "weekly")
+            for name in ("weekly", "monthly") for kind in ("st", "rsi")
+        }
+        streaks = {
+            "flipped": streak(st_up),  # within the current bull run, the Supertrend rising each day
+            "rising": streak(above & st_up & rising_flags(sma3) & rising_flags(sma9)),
+            "above": streak(above),
+            "mtf": streak(st_up & tf_day["weekly", "st"] & tf_day["monthly", "st"]),
+            "sma": streak(sma_condition_flags(ha["close"])),
+            "rsi": streak((daily_rsi > RSI_LEVEL) & (daily_rsi > daily_rsi_ma)
+                          & tf_day["weekly", "rsi"] & tf_day["monthly", "rsi"]),
+        }
         mtf = MultiTimeframe(
             symbol=symbol,
+            streak=streaks,
             close=float(close[-1]),
             change_pct=float((close[-1] / close[-2] - 1) * 100),
             chart=mini_chart(ha, line, direction, upper, years),
@@ -428,6 +495,7 @@ def analyze_frame(
         bars_in_trend=int(len(direction) - flip_index),
         change_pct=float((close[-1] / close[-2] - 1) * 100),
         chart=mini_chart(ha, line, direction, upper, years),
+        streak=mtf.streak if mtf else {},
     )
     return Result(last_date, True, above_band, signal, mtf, detail)
 
@@ -481,6 +549,13 @@ def stock_cell(symbol: str, companies: dict[str, str]) -> str:
         f'<a href="{html.escape(tradingview_url(symbol))}" target="_blank" rel="noopener">{sym}</a>'
         f'<span title="{name}">{name}</span></td>'
     )
+
+
+def days_cell(days: int) -> str:
+    """Trading days the stock has been in the tab's list (today = 1); — if it isn't in it."""
+    if days <= 0:
+        return '<td class="num" data-v="0"><span class="dim">&mdash;</span></td>'
+    return f'<td class="num" data-v="{days}"><b>{days}</b></td>'
 
 
 def num_cell(value: float, text: str, extra: str = "") -> str:
@@ -604,6 +679,7 @@ def pack_details(details: dict[str, dict], companies: dict[str, str]) -> dict:
         packed["dir"] = "".join("+" if v == 1 else "-" for v in det["dir"])
         # RSI as integer tenths: daily per candle; weekly/monthly per period (shared labels).
         packed["rd"], packed["rdm"] = tenths(det.get("rd", [])), tenths(det.get("rdm", []))
+        packed["sg"] = det.get("sg", "")
         own = det["d"] if det["d"] != dates[-len(det["d"]):] else None
         w_labels, m_labels = (period_labels(own)[0], period_labels(own)[2]) if own else (weeks, months)
         rw, rm = det.get("rw", {}), det.get("rm", {})
@@ -638,6 +714,7 @@ def render(
             stock_cell(f.signal.symbol, companies),
             num_cell(f.signal.close, f"{f.signal.close:,.2f}"),
             change_cell(f.signal.change_pct),
+            days_cell(f.signal.streak.get("flipped", 0)),
             delta_cell(f.signal.st_change_pct),
             bars_cell(f.signal.bars_in_trend, scale),
             f'<td data-v="{f.first_listed}" class="date">{f.first_listed}</td>',
@@ -654,6 +731,7 @@ def render(
             stock_cell(s.symbol, companies),
             num_cell(s.close, f"{s.close:,.2f}"),
             change_cell(s.change_pct),
+            days_cell(s.streak.get("rising", 0)),
             delta_cell(s.st_change_pct),
             delta_cell(s.sma3_change_pct),
             delta_cell(s.sma9_change_pct),
@@ -667,6 +745,7 @@ def render(
             stock_cell(s.symbol, companies),
             num_cell(s.close, f"{s.close:,.2f}"),
             change_cell(s.change_pct),
+            days_cell(s.streak.get("above", 0)),
             bars_cell(s.bars_in_trend, scale),
             f'<td class="spark-cell">{s.chart}</td>',
         ], fresh=s.bars_in_trend <= 3)
@@ -678,6 +757,7 @@ def render(
             stock_cell(m.symbol, companies),
             num_cell(m.close, f"{m.close:,.2f}"),
             change_cell(m.change_pct),
+            days_cell(m.streak.get("mtf", 0)),
             trend_cell(m.daily),
             trend_cell(m.weekly),
             trend_cell(m.monthly),
@@ -692,6 +772,7 @@ def render(
             stock_cell(m.symbol, companies),
             num_cell(m.close, f"{m.close:,.2f}"),
             change_cell(m.change_pct),
+            days_cell(m.streak.get("sma", 0)),
             *(sma_cell(m.sma_change[p]) for p in SMA_PERIODS),
             *(gap_cell(m.sma_gap(f, s)) for f, s in SMA_PAIRS),
         ], attrs="".join(f' data-{k}="{int(v)}"' for k, v in m.sma_conditions.items()))
@@ -704,6 +785,7 @@ def render(
             stock_cell(m.symbol, companies),
             num_cell(m.close, f"{m.close:,.2f}"),
             change_cell(m.change_pct),
+            days_cell(m.streak.get("rsi", 0)),
             rsi_cell(m.rsi["d"]),
             rsi_ma_cell(m.rsi["d"], m.rsi["d_ma"]),
             rsi_cell(m.rsi["w"]),
@@ -714,6 +796,34 @@ def render(
         for m in rsis
     ]
     rsi_all = sum(all(m.rsi_conditions.values()) for m in rsis)
+
+    # Combined: which of the five tabs (default filters, Above VWAP Band excluded) each stock is in.
+    tab_members = {
+        "Bullish Re-entry": {f.signal.symbol: f.signal.streak.get("flipped", 0) for f in flipped},
+        "Above VWAP \u00b7 Rising": {x.symbol: x.streak.get("rising", 0) for x in rising},
+        "Multi-Timeframe Rising": {m.symbol: m.streak.get("mtf", 0) for m in mtfs if all(v.rising for v in m.steps.values())},
+        "SMA Gaining": {m.symbol: m.streak.get("sma", 0) for m in smas if all(m.sma_conditions.values())},
+        "RSI 70": {m.symbol: m.streak.get("rsi", 0) for m in rsis if all(m.rsi_conditions.values())},
+    }
+    combined: dict[str, list[tuple[str, int]]] = {}
+    for tab, members in tab_members.items():
+        for sym, days in members.items():
+            combined.setdefault(sym, []).append((tab, days))
+    combined_rows = []
+    for sym, tabs in sorted(combined.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        det = details.get(sym, {})
+        chips = "".join(
+            f'<span class="chip">{html.escape(tab)} <b>{days}d</b></span>' for tab, days in tabs
+        )
+        combined_rows.append(row(sym, companies, [
+            stock_cell(sym, companies),
+            num_cell(det.get("close", 0), f"{det['close']:,.2f}" if det else ""),
+            change_cell(det.get("chg", 0.0)),
+            f'<td class="num" data-v="{len(tabs)}"><span class="tab-count">'
+            + "".join('<i class="on"></i>' if k < len(tabs) else "<i></i>" for k in range(len(tab_members)))
+            + f'<b>{len(tabs)} / {len(tab_members)}</b></span></td>',
+            f'<td class="chips">{chips}</td>',
+        ]))
 
     series = [{"d": day, "n": len(stocks)} for day, stocks in sorted(history.items())]
     prev = series[-2]["n"] if len(series) > 1 else None
@@ -746,6 +856,8 @@ def render(
         "SMA_ALL": str(sma_all),
         "RSI_ROWS": "\n".join(rsi_rows),
         "RSI_ALL": str(rsi_all),
+        "COMBINED_ROWS": "\n".join(combined_rows),
+        "COMBINED_COUNT": str(len(combined)),
         # Embedded as JSON; escape "</" so it can't close the script tag.
         "DETAILS": json.dumps(pack_details(details, companies), separators=(",", ":")).replace("</", "<\\/"),
         "SYMBOL_OPTIONS": "".join(
@@ -901,6 +1013,16 @@ tr.fresh .stock a::after {
 .age-bar { width: 56px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
 .age-bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
 .date { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.tab-count { display: inline-flex; align-items: center; gap: 3px; }
+.tab-count i { width: 8px; height: 8px; border-radius: 2px; background: var(--surface-2); border: 1px solid var(--ring); }
+.tab-count i.on { background: var(--up); border-color: var(--up); }
+.tab-count b { margin-left: 6px; font-variant-numeric: tabular-nums; }
+td.chips { white-space: normal; }
+.chip {
+  display: inline-block; margin: 2px 6px 2px 0; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+  background: var(--surface-2); color: var(--ink-2); white-space: nowrap;
+}
+.chip b { color: var(--ink); font-variant-numeric: tabular-nums; }
 .tag { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--fresh); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; }
 .dim { color: var(--muted); }
 .spark-cell { padding-top: 4px; padding-bottom: 4px; }
@@ -980,6 +1102,11 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 .long-sma[hidden], .dlg-legend .ind[hidden], .rsi-tf[hidden] { display: none; }
 .zoom.rsi-tf { margin-left: 0; }
 .dlg-chart.with-rsi { height: 580px; }
+.dc .sma-run { fill: var(--up); opacity: .07; }
+.dc .sma-start { fill: var(--up); stroke: var(--surface); stroke-width: 2; }
+.dc .sma-start-icon { fill: #fff; font-size: 7px; }
+.dc .sma-start-label { fill: var(--up); font-size: 9px; font-weight: 700; }
+.dc .sma-start-stem { stroke: var(--up); stroke-width: 1; opacity: .6; }
 .dc .pane-title { font-size: 11px; font-weight: 600; fill: var(--ink-2); }
 .dc .rsi-zone { fill: var(--ink); opacity: .035; }
 .dc .rsi-level { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 4 3; }
@@ -1078,6 +1205,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <button class="tab" role="tab" id="tab-mtf" aria-controls="panel-mtf" aria-selected="false" tabindex="-1">Multi-Timeframe Rising <span class="count" id="mtf-count">%%MTF_ALL%%</span></button>
       <button class="tab" role="tab" id="tab-sma" aria-controls="panel-sma" aria-selected="false" tabindex="-1">SMA Gaining <span class="count" id="sma-count">%%SMA_ALL%%</span></button>
       <button class="tab" role="tab" id="tab-rsi" aria-controls="panel-rsi" aria-selected="false" tabindex="-1">RSI 70 <span class="count" id="rsi-count">%%RSI_ALL%%</span></button>
+      <button class="tab" role="tab" id="tab-combined" aria-controls="panel-combined" aria-selected="false" tabindex="-1">Combined <span class="count">%%COMBINED_COUNT%%</span></button>
       <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Above VWAP Band <span class="count">%%COUNT%%</span></button>
     </nav>
 
@@ -1089,11 +1217,12 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
           <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
         </div>
         <div class="table-wrap">
-          <table data-sort="4">
+          <table data-sort="5">
             <thead><tr>
               <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Trading days in a row this stock has met the tab's default filters (today = 1)">Days</th>
               <th class="num" data-type="num" title="Supertrend change vs previous candle">ST &Delta;</th>
               <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
               <th data-type="text">First listed</th>
@@ -1116,11 +1245,12 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
           <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
         </div>
         <div class="table-wrap">
-          <table data-sort="6">
+          <table data-sort="7">
             <thead><tr>
               <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Trading days in a row this stock has met the tab's default filters (today = 1)">Days</th>
               <th class="num" data-type="num" title="Supertrend change vs previous candle">ST &Delta;</th>
               <th class="num" data-type="num" title="SMA 3 change vs previous candle">SMA 3 &Delta;</th>
               <th class="num" data-type="num" title="SMA 9 change vs previous candle">SMA 9 &Delta;</th>
@@ -1154,6 +1284,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
               <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Trading days in a row this stock has met the tab's default filters (today = 1)">Days</th>
               <th class="num" data-type="num" title="Daily Heikin Ashi Supertrend vs previous day">Daily ST</th>
               <th class="num" data-type="num" title="Weekly Heikin Ashi Supertrend vs previous week (current week in progress)">Weekly ST</th>
               <th class="num" data-type="num" title="Monthly Heikin Ashi Supertrend vs previous month (current month in progress)">Monthly ST</th>
@@ -1195,6 +1326,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
               <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Trading days in a row this stock has met the tab's default filters (today = 1)">Days</th>
               <th class="num" data-type="num" title="SMA 3 of Heikin Ashi close vs previous day">SMA 3</th>
               <th class="num" data-type="num" title="SMA 9 of Heikin Ashi close vs previous day">SMA 9</th>
               <th class="num" data-type="num" title="SMA 20 of Heikin Ashi close vs previous day">SMA 20</th>
@@ -1238,6 +1370,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
               <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Trading days in a row this stock has met the tab's default filters (today = 1)">Days</th>
               <th class="num" data-type="num" title="RSI 14 of daily Heikin Ashi close">Daily RSI</th>
               <th class="num" data-type="num" title="SMA 14 of daily RSI, and RSI minus that SMA">Daily RSI SMA</th>
               <th class="num" data-type="num" title="RSI 14 of weekly Heikin Ashi close (current week in progress)">Weekly RSI</th>
@@ -1253,6 +1386,28 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
         </div>
       </section>
 
+      <section class="card panel" role="tabpanel" id="panel-combined" aria-labelledby="tab-combined" hidden>
+        <div class="panel-head">
+          <h2>Combined</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+        </div>
+        <div class="table-wrap">
+          <table data-sort="3" data-dir="descending">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="How many of the five tabs (Above VWAP Band excluded) list this stock, using each tab's default filters">Tabs</th>
+              <th>In tabs (days in each)</th>
+            </tr></thead>
+            <tbody>
+%%COMBINED_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
+      </section>
+
       <section class="card panel" role="tabpanel" id="panel-signals" aria-labelledby="tab-signals" hidden>
         <div class="panel-head">
           <h2>Above VWAP Band</h2>
@@ -1261,11 +1416,12 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
           <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
         </div>
         <div class="table-wrap">
-          <table data-sort="3">
+          <table data-sort="4">
             <thead><tr>
               <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Trading days in a row this stock has met the tab's default filters (today = 1)">Days</th>
               <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
               <th>Last 40 candles</th>
             </tr></thead>
@@ -1290,21 +1446,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <button class="dlg-close" id="detail-close-btn" aria-label="Close" autofocus>&times;</button>
     </div>
   </div>
-  <div class="dlg-legend" aria-label="Legend">
-    <span class="ind"><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="2.75" stroke-linecap="round"/></svg>Supertrend</span>
-    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.75" stroke-dasharray="6 4" stroke-linecap="round"/></svg>SMA 3</span>
-    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.75" stroke-dasharray="1 4" stroke-linecap="round"/></svg>SMA 9</span>
-    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.5" stroke-dasharray="10 3 2 3"/></svg>SMA 20</span>
-    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.5" stroke-dasharray="14 5"/></svg>SMA 50</span>
-    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.25"/></svg>SMA 100</span>
-    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="3.5" opacity=".45"/></svg>SMA 200</span>
-    <span class="ind"><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--band)" stroke-width="1.5"/></svg>VWAP band</span>
-    <i class="sep"></i>
-    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--up)" stroke-width="2.75" stroke-linecap="round"/></svg>Rising</span>
-    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--muted)" stroke-width="2.75" stroke-linecap="round"/></svg>Not rising</span>
-    <i class="sep ind"></i>
-    <span class="ind"><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-up"/></svg>Cross above</span>
-    <span class="ind"><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-down"/></svg>Cross below</span>
+  <div class="dlg-legend" aria-label="Chart options">
     <label class="sma-toggle"><input type="checkbox" id="show-smas"> All SMAs</label>
     <label class="sma-toggle"><input type="checkbox" id="show-rsi"> RSI</label>
     <div class="zoom rsi-tf" role="group" aria-label="RSI timeframe" hidden>
@@ -1393,7 +1535,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     search.addEventListener("input", filter);
     if (freshOnly) freshOnly.addEventListener("change", filter);
     tfChecks.forEach(c => c.addEventListener("change", filter));
-    sortBy(Number(table.dataset.sort), "ascending");
+    sortBy(Number(table.dataset.sort), table.dataset.dir || "ascending");
     filter();
   }
 
@@ -1446,6 +1588,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       o: f(r.o), h: f(r.h), l: f(r.l), c: f(r.c), st: f(r.st), s3: f(r.s3), s9: f(r.s9), vw: f(r.vw), up: f(r.up),
       ...longSmas(f(r.cx || []), f(r.c)),
       rsi: decodeRsi(r, len),
+      sg: [...(r.sg || "")].map(ch => ch === "1"),  // all SMA Gaining conditions met that day
       dir: [...r.dir].map(ch => ch === "+" ? 1 : -1),
       close: r.close / 100, chg: r.chg / 100, name: r.n,
     };
@@ -1517,6 +1660,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     const all = [b.h, b.l, b.s3, b.s9, ...indicators, ...extra].flatMap(a => a.slice(start, end)).filter(v => v != null);
     let lo = Math.min(...all), hi = Math.max(...all);
     const margin = (hi - lo) * 0.04 || 1; lo -= margin; hi += margin;
+    if (showAllSmas) hi += (hi - lo) * 0.08;  // room above candles for the SMA start markers
     const x = i => pad.l + (i - start + 0.5) * step;
     const y = v => priceTop + ((hi - v) / (hi - lo)) * ih;
     const svg = el("svg", {class: "dc", viewBox: `0 0 ${W} ${H}`, tabindex: 0, role: "img",
@@ -1568,6 +1712,18 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       }
       for (const [kind, d] of Object.entries(paths)) if (d) el("path", {d, class: `seg ${kind} ${width}`}, svg);
     }
+    // SMA mode: shade days where every SMA Gaining condition holds, and mark where each run starts.
+    const smaStarts = {};
+    if (showAllSmas) {
+      for (let i = start; i < end; i++) {
+        if (!b.sg[i]) continue;
+        let j = i;
+        while (j + 1 < end && b.sg[j + 1]) j++;
+        el("rect", {x: x(i) - step / 2, y: priceTop, width: (j - i + 1) * step, height: ih, class: "sma-run"}, svg);
+        if (i > 0 && !b.sg[i - 1]) smaStarts[i] = true;  // a real start, not the edge of the data or view
+        i = j;
+      }
+    }
     if (showAllSmas) for (const p of [200, 100, 50, 20]) segments(b["s" + p], "w-s" + p);
     segments(b.s9, "w-s9");
     segments(b.s3, "w-s3");
@@ -1590,6 +1746,14 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
         el("text", {x: cx, y: kind === "up" ? cy - 14 : cy + 22, "text-anchor": "middle", class: `mk-label ${kind}`},
           svg).textContent = kind === "up" ? "\u25B2" : "\u25BC";
       }
+    }
+
+    for (const k of Object.keys(smaStarts)) {
+      const i = Number(k), cx = x(i), top = y(b.h[i]) - 16;
+      el("line", {x1: cx, x2: cx, y1: top + 6, y2: y(b.h[i]) - 3, class: "sma-start-stem"}, svg);
+      el("circle", {cx, cy: top, r: 6, class: "sma-start"}, svg);
+      el("text", {x: cx, y: top + 3, "text-anchor": "middle", class: "sma-start-icon"}, svg).textContent = "\u25B2";
+      el("text", {x: cx, y: top - 10, "text-anchor": "middle", class: "sma-start-label"}, svg).textContent = "SMA";
     }
 
     // Right-edge labels, nudged apart so they never overlap
@@ -1662,6 +1826,12 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
         if (rising) v.className = "rise";
         item.append(l, v);
         readout.append(item);
+      }
+      if (showAllSmas && b.sg[i]) {
+        const note = document.createElement("span");
+        note.className = "r-cross up";
+        note.textContent = "\u2713 All SMA conditions met" + (i > 0 && !b.sg[i - 1] ? " (started)" : "");
+        readout.append(note);
       }
       if (crossings[i]) {
         const note = document.createElement("span");
@@ -1835,7 +2005,7 @@ def signal_records(signals: list[Signal]) -> list[dict]:
         {
             k: round(v, 4) if isinstance(v, float) else v
             for k, v in asdict(s).items()
-            if k not in ("date", "chart", "st_change_pct", "sma3_change_pct", "sma9_change_pct")
+            if k not in ("date", "chart", "st_change_pct", "sma3_change_pct", "sma9_change_pct", "streak")
         }
         for s in sorted(signals, key=lambda s: s.symbol)
     ]
