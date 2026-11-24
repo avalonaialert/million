@@ -281,6 +281,8 @@ def chart_detail(
         "h": rounded(ha["high"].to_numpy()[-n:]),
         "l": rounded(ha["low"].to_numpy()[-n:]),
         "c": rounded(ha["close"].to_numpy()[-n:]),
+        # Heikin Ashi closes just before the window, so the page can compute SMAs up to 200.
+        "cx": rounded(ha["close"].to_numpy()[-(n + max(SMA_PERIODS)):-n]),
         "st": rounded(line[-n:]),
         "dir": direction[-n:].tolist(),
         "s3": rounded(sma3[-n:]),
@@ -500,7 +502,7 @@ def pack_details(details: dict[str, dict], companies: dict[str, str]) -> dict:
     cents = lambda values: [None if v is None else round(v * 100) for v in values]
     stocks = {}
     for sym, det in sorted(details.items()):
-        packed = {key: cents(det[key]) for key in ("o", "h", "l", "c", "st", "s3", "s9", "vw", "up")}
+        packed = {key: cents(det[key]) for key in ("o", "h", "l", "c", "cx", "st", "s3", "s9", "vw", "up")}
         packed["dir"] = "".join("+" if v == 1 else "-" for v in det["dir"])
         packed["close"] = round(det["close"] * 100)
         packed["chg"] = round(det["chg"] * 100)
@@ -842,6 +844,12 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 .dc .w-st { stroke-width: 2.75; }
 .dc .w-s3 { stroke-width: 1.75; stroke-dasharray: 6 4; }
 .dc .w-s9 { stroke-width: 1.75; stroke-dasharray: 1 4; }
+.dc .w-s20 { stroke-width: 1.5; stroke-dasharray: 10 3 2 3; }
+.dc .w-s50 { stroke-width: 1.5; stroke-dasharray: 14 5; }
+.dc .w-s100 { stroke-width: 1.25; }
+.dc .w-s200 { stroke-width: 3.5; opacity: .45; }
+.sma-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-weight: 600; cursor: pointer; }
+.long-sma[hidden], .dlg-legend .ind[hidden] { display: none; }
 .dc .end { font-size: 11px; font-weight: 600; fill: var(--ink-2); }
 .mk-up { fill: var(--up); stroke: var(--surface); stroke-width: 2; }
 .mk-down { fill: var(--down); stroke: var(--surface); stroke-width: 2; }
@@ -1096,16 +1104,21 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     </div>
   </div>
   <div class="dlg-legend" aria-label="Legend">
-    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="2.75" stroke-linecap="round"/></svg>Supertrend</span>
+    <span class="ind"><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="2.75" stroke-linecap="round"/></svg>Supertrend</span>
     <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.75" stroke-dasharray="6 4" stroke-linecap="round"/></svg>SMA 3</span>
     <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.75" stroke-dasharray="1 4" stroke-linecap="round"/></svg>SMA 9</span>
-    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--band)" stroke-width="1.5"/></svg>VWAP band</span>
+    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.5" stroke-dasharray="10 3 2 3"/></svg>SMA 20</span>
+    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.5" stroke-dasharray="14 5"/></svg>SMA 50</span>
+    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.25"/></svg>SMA 100</span>
+    <span class="long-sma" hidden><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="3.5" opacity=".45"/></svg>SMA 200</span>
+    <span class="ind"><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--band)" stroke-width="1.5"/></svg>VWAP band</span>
     <i class="sep"></i>
     <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--up)" stroke-width="2.75" stroke-linecap="round"/></svg>Rising</span>
     <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--muted)" stroke-width="2.75" stroke-linecap="round"/></svg>Not rising</span>
-    <i class="sep"></i>
-    <span><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-up"/></svg>Cross above</span>
-    <span><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-down"/></svg>Cross below</span>
+    <i class="sep ind"></i>
+    <span class="ind"><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-up"/></svg>Cross above</span>
+    <span class="ind"><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-down"/></svg>Cross below</span>
+    <label class="sma-toggle"><input type="checkbox" id="show-smas"> All SMAs</label>
     <div class="zoom" role="group" aria-label="Range">
       <button type="button" data-span="40">40D</button><button type="button" data-span="90">90D</button><button type="button" data-span="180">180D</button>
     </div>
@@ -1196,6 +1209,23 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
   /* ---------- Stock detail pop-up ---------- */
   const RAW = JSON.parse(document.getElementById("details-data").textContent);
   const DETAILS = {};
+  // SMA 20/50/100/200 of Heikin Ashi close for each visible candle, using the extra
+  // closes before the window ("cx"). null where there isn't enough history.
+  const LONG_SMAS = [20, 50, 100, 200];
+  function longSmas(before, closes) {
+    const full = before.concat(closes), off = before.length, out = {};
+    for (const p of LONG_SMAS) {
+      out["s" + p] = closes.map((_, i) => {
+        const j = off + i;
+        if (j + 1 < p) return null;
+        let sum = 0;
+        for (let k = j - p + 1; k <= j; k++) { if (full[k] == null) return null; sum += full[k]; }
+        return sum / p;
+      });
+    }
+    return out;
+  }
+  let showAllSmas = false;
   function getDetail(sym) {
     if (DETAILS[sym]) return DETAILS[sym];
     const r = RAW.stocks[sym];
@@ -1205,6 +1235,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     return DETAILS[sym] = {
       d: r.d || RAW.dates.slice(RAW.dates.length - len),
       o: f(r.o), h: f(r.h), l: f(r.l), c: f(r.c), st: f(r.st), s3: f(r.s3), s9: f(r.s9), vw: f(r.vw), up: f(r.up),
+      ...longSmas(f(r.cx || []), f(r.c)),
       dir: [...r.dir].map(ch => ch === "+" ? 1 : -1),
       close: r.close / 100, chg: r.chg / 100, name: r.n,
     };
@@ -1264,7 +1295,9 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     const W = chartHost.clientWidth - 16, H = chartHost.clientHeight - 16;
     const pad = {l: 56, r: 92, t: 12, b: 26};
     const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b, step = iw / span;
-    const all = [b.h, b.l, b.st, b.s3, b.s9, b.up, b.vw].flatMap(a => a.slice(start, end)).filter(v => v != null);
+    const extra = showAllSmas ? LONG_SMAS.map(p => b["s" + p]) : [];
+    const indicators = showAllSmas ? [] : [b.st, b.up, b.vw];
+    const all = [b.h, b.l, b.s3, b.s9, ...indicators, ...extra].flatMap(a => a.slice(start, end)).filter(v => v != null);
     let lo = Math.min(...all), hi = Math.max(...all);
     const margin = (hi - lo) * 0.04 || 1; lo -= margin; hi += margin;
     const x = i => pad.l + (i - start + 0.5) * step;
@@ -1291,7 +1324,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       if (b.up[i] != null && b.vw[i] != null) cur.push(i);
     }
     if (cur.length) runs.push(cur);
-    for (const r of runs) {
+    for (const r of showAllSmas ? [] : runs) {  // hidden in "All SMAs" mode
       const top = r.map(i => `${x(i)},${y(b.up[i])}`), bot = r.slice().reverse().map(i => `${x(i)},${y(b.vw[i])}`);
       el("polygon", {points: top.concat(bot).join(" "), class: "band-fill"}, svg);
       el("polyline", {points: top.join(" "), class: "band"}, svg);
@@ -1318,14 +1351,15 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       }
       for (const [kind, d] of Object.entries(paths)) if (d) el("path", {d, class: `seg ${kind} ${width}`}, svg);
     }
+    if (showAllSmas) for (const p of [200, 100, 50, 20]) segments(b["s" + p], "w-s" + p);
     segments(b.s9, "w-s9");
     segments(b.s3, "w-s3");
-    segments(b.st, "w-st", i => b.dir[i] !== b.dir[i - 1]);
+    if (!showAllSmas) segments(b.st, "w-st", i => b.dir[i] !== b.dir[i - 1]);
 
     // Supertrend crossing the VWAP upper band. Ignore Supertrend flips (the line jumps
     // between bands) and the January VWAP reset, which aren't real crossings.
     const crossings = {};
-    for (let i = start + 1; i < end; i++) {
+    for (let i = showAllSmas ? end : start + 1; i < end; i++) {  // none in "All SMAs" mode
       const s0 = b.st[i - 1], s1 = b.st[i], u0 = b.up[i - 1], u1 = b.up[i];
       if ([s0, s1, u0, u1].some(v => v == null) || b.dir[i] !== b.dir[i - 1] || !sameYear(i)) continue;
       const d0 = s0 - u0, d1 = s1 - u1;
@@ -1344,7 +1378,9 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     // Right-edge labels, nudged apart so they never overlap
     const last = end - 1;
     syncScrollbar(n, start);
-    const labels = [["Supertrend", b.st[last]], ["SMA 3", b.s3[last]], ["SMA 9", b.s9[last]], ["VWAP band", b.up[last]]]
+    const labels = (showAllSmas
+      ? [["SMA 3", b.s3[last]], ["SMA 9", b.s9[last]], ...LONG_SMAS.map(p => ["SMA " + p, b["s" + p][last]])]
+      : [["Supertrend", b.st[last]], ["SMA 3", b.s3[last]], ["SMA 9", b.s9[last]], ["VWAP band", b.up[last]]])
       .filter(([, v]) => v != null).map(([t, v]) => ({t, y: y(v)})).sort((a, c) => a.y - c.y);
     for (let k = 1; k < labels.length; k++) labels[k].y = Math.max(labels[k].y, labels[k - 1].y + 13);
     for (const lab of labels) el("text", {x: W - pad.r + 8, y: lab.y + 4, class: "end"}, svg).textContent = lab.t;
@@ -1357,11 +1393,11 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       const up = (arr, extra) => i > 0 && arr[i] != null && arr[i - 1] != null && arr[i] > arr[i - 1] && (!extra || extra());
       return [
         ["O", money(b.o[i])], ["H", money(b.h[i])], ["L", money(b.l[i])], ["C", money(b.c[i])],
-        ["Supertrend", money(b.st[i]), up(b.st, () => b.dir[i] === b.dir[i - 1])],
+        ...(showAllSmas ? [] : [["Supertrend", money(b.st[i]), up(b.st, () => b.dir[i] === b.dir[i - 1])]]),
         ["SMA 3", money(b.s3[i]), up(b.s3)],
         ["SMA 9", money(b.s9[i]), up(b.s9)],
-        ["VWAP band", money(b.up[i])],
-        ["VWAP", money(b.vw[i])],
+        ...(showAllSmas ? LONG_SMAS.map(p => ["SMA " + p, money(b["s" + p][i]), up(b["s" + p])]) : []),
+        ...(showAllSmas ? [] : [["VWAP band", money(b.up[i])], ["VWAP", money(b.vw[i])]]),
       ];
     }
     // The strip shows the hovered candle, or the latest candle when not hovering.
@@ -1446,6 +1482,14 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     });
   });
   zoomButtons.forEach(z => z.addEventListener("click", () => zoomTo(Number(z.dataset.span))));
+  // "All SMAs" adds SMA 20/50/100/200; the choice is kept while the page is open.
+  document.getElementById("show-smas").addEventListener("change", e => {
+    showAllSmas = e.target.checked;
+    document.querySelectorAll(".long-sma").forEach(el => { el.hidden = !showAllSmas; });
+    // SMA mode shows only candles and SMAs: hide Supertrend, VWAP band and crossing markers.
+    document.querySelectorAll(".dlg-legend .ind").forEach(el => { el.hidden = showAllSmas; });
+    if (openSym) drawDetail();
+  });
   // Mouse wheel up/down or trackpad pinch zooms (keeping the right edge in place).
   // Sideways swipe or Shift + wheel pans through dates.
   let panCarry = 0;
