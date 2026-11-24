@@ -32,6 +32,13 @@ DETAIL_BARS = 180
 # Skip symbols whose data stops this many days before the newest file
 # (e.g. companies that have left the index).
 STALE_DAYS = 7
+# Saved TradingView chart layout that stock links open (with the stock's symbol filled in).
+TRADINGVIEW_LAYOUT = "R6fMef6E"
+
+
+def tradingview_url(symbol: str) -> str:
+    """TradingView chart link; TradingView writes share classes with a dot (BRK.B), Yahoo with a dash."""
+    return f"https://www.tradingview.com/chart/{TRADINGVIEW_LAYOUT}/?symbol={symbol.replace('-', '.')}"
 # SMA periods (on Heikin Ashi closes) checked by the "SMA Gaining" tab.
 SMA_PERIODS = (3, 9, 20, 50, 100, 200)
 # Daily bars used to build weekly and monthly candles (~15 years).
@@ -210,6 +217,34 @@ def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return bars.dropna()
 
 
+RSI_PERIOD = 14      # Wilder RSI length
+RSI_MA_PERIOD = 14   # SMA of RSI (TradingView's default RSI moving average)
+RSI_LEVEL = 70
+
+
+def rsi(close: np.ndarray, period: int = RSI_PERIOD) -> np.ndarray:
+    """Wilder's RSI (as on TradingView): RMA of gains and losses, seeded with a simple average."""
+    out = np.full(len(close), np.nan)
+    if len(close) <= period:
+        return out
+    delta = np.diff(close)
+    gain, loss = np.clip(delta, 0, None), np.clip(-delta, 0, None)
+    avg_gain, avg_loss = gain[:period].mean(), loss[:period].mean()
+    for i in range(period, len(close)):
+        if i > period:
+            avg_gain = (avg_gain * (period - 1) + gain[i - 1]) / period
+            avg_loss = (avg_loss * (period - 1) + loss[i - 1]) / period
+        out[i] = 100.0 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
+    return out
+
+
+def rsi_stats(close: np.ndarray) -> tuple[float, float]:
+    """(latest RSI, latest SMA of RSI); NaN when there isn't enough history."""
+    values = rsi(close)
+    ma = pd.Series(values).rolling(RSI_MA_PERIOD).mean().to_numpy()
+    return float(values[-1]), float(ma[-1])
+
+
 def sma_stats(close: pd.Series, periods: tuple[int, ...]) -> tuple[dict[int, float], dict[int, float]]:
     """(% change of each SMA on the latest bar vs the previous bar, latest SMA value)."""
     changes, levels = {}, {}
@@ -235,6 +270,16 @@ class MultiTimeframe:
     chart: str
     sma_change: dict[int, float]  # % change of each SMA vs the previous day (NaN if not enough bars)
     sma_level: dict[int, float]  # latest value of each SMA
+    rsi: dict[str, float]  # "d"/"w"/"m": RSI on daily/weekly/monthly Heikin Ashi close; "<tf>_ma": SMA of that RSI
+
+    @property
+    def rsi_conditions(self) -> dict[str, bool]:
+        """Filter key -> met: r<tf> = RSI above 70, m<tf> = RSI above its SMA (tf = d, w or m)."""
+        out = {}
+        for tf in ("d", "w", "m"):
+            out[f"r{tf}"] = self.rsi[tf] > RSI_LEVEL  # NaN compares False
+            out[f"m{tf}"] = self.rsi[tf] > self.rsi[f"{tf}_ma"]
+        return out
 
     def sma_gap(self, fast: int, slow: int) -> float:
         """% by which the fast SMA is above (+) or below (-) the slow SMA."""
@@ -324,18 +369,40 @@ def analyze_frame(
         detail = {"sym": symbol, **chart_detail(dates, ha, line, direction, sma3, sma9, vwap, upper, close)}
         steps = {"daily": trend_step(line, direction)}
         recent = full.tail(MTF_DAILY_BARS)
+        tf_close = {"weekly": np.array([]), "monthly": np.array([])}
+        tf_rsi = {}  # "weekly"/"monthly" -> {period label: (RSI, SMA of RSI)} for the pop-up chart
         for name, rule in (("weekly", "W-FRI"), ("monthly", "ME")):
             bars = resample(recent, rule)
             if len(bars) < period + 2:
                 steps[name] = TrendStep("na")
                 continue
-            steps[name] = trend_step(*supertrend(heikin_ashi(bars), period, multiplier))
+            ha_tf = heikin_ashi(bars)
+            steps[name] = trend_step(*supertrend(ha_tf, period, multiplier))
+            tf_close[name] = ha_tf["close"].to_numpy()
+            values = rsi(tf_close[name])
+            ma = pd.Series(values).rolling(RSI_MA_PERIOD).mean().to_numpy()
+            fmt = "%Y-%m-%d" if name == "weekly" else "%Y-%m"
+            keep = 45 if name == "weekly" else 14  # enough periods to cover the chart window
+            tf_rsi[name] = {
+                label.strftime(fmt): (values[k], ma[k])
+                for k, label in list(enumerate(bars.index))[-keep:]
+            }
+        nan2 = (float("nan"), float("nan"))
+        rsi_d, rsi_d_ma = rsi_stats(ha["close"].to_numpy())
+        rsi_w, rsi_w_ma = rsi_stats(tf_close["weekly"]) if len(tf_close["weekly"]) else nan2
+        rsi_m, rsi_m_ma = rsi_stats(tf_close["monthly"]) if len(tf_close["monthly"]) else nan2
+        daily_rsi = rsi(ha["close"].to_numpy())
+        detail["rd"] = rounded(daily_rsi[-DETAIL_BARS:])
+        detail["rdm"] = rounded(pd.Series(daily_rsi).rolling(RSI_MA_PERIOD).mean().to_numpy()[-DETAIL_BARS:])
+        detail["rw"] = tf_rsi.get("weekly", {})
+        detail["rm"] = tf_rsi.get("monthly", {})
         mtf = MultiTimeframe(
             symbol=symbol,
             close=float(close[-1]),
             change_pct=float((close[-1] / close[-2] - 1) * 100),
             chart=mini_chart(ha, line, direction, upper, years),
             **dict(zip(("sma_change", "sma_level"), sma_stats(ha["close"], SMA_PERIODS))),
+            rsi={"d": rsi_d, "d_ma": rsi_d_ma, "w": rsi_w, "w_ma": rsi_w_ma, "m": rsi_m, "m_ma": rsi_m_ma},
             **steps,
         )
     if direction[-1] != 1:
@@ -411,7 +478,7 @@ def stock_cell(symbol: str, companies: dict[str, str]) -> str:
     name = html.escape(companies.get(symbol, ""))
     return (
         f'<td class="stock" data-v="{sym}">'
-        f'<a href="https://finance.yahoo.com/quote/{sym}" target="_blank" rel="noopener">{sym}</a>'
+        f'<a href="{html.escape(tradingview_url(symbol))}" target="_blank" rel="noopener">{sym}</a>'
         f'<span title="{name}">{name}</span></td>'
     )
 
@@ -457,6 +524,25 @@ def pct(value: float) -> str:
     return f"{value:+.2f}%"
 
 
+def rsi_cell(value: float) -> str:
+    """RSI value; above 70 is highlighted and marked, not just colored."""
+    if value != value:
+        return '<td class="num" data-v="-1"><span class="tf na">&mdash;</span></td>'
+    if value > RSI_LEVEL:
+        return f'<td class="num" data-v="{value}"><span class="tf up">&#9650; {value:.1f}</span></td>'
+    return f'<td class="num" data-v="{value}"><span class="tf flat">{value:.1f}</span></td>'
+
+
+def rsi_ma_cell(value: float, ma: float) -> str:
+    """RSI versus its SMA, in RSI points: above ✓ or below ✗."""
+    if value != value or ma != ma:
+        return '<td class="num" data-v="-1000"><span class="tf na">&mdash;</span></td>'
+    gap = value - ma
+    if gap > 0:
+        return f'<td class="num" data-v="{gap}"><span class="tf up">&#10003; {ma:.1f} ({gap:+.1f})</span></td>'
+    return f'<td class="num" data-v="{gap}"><span class="tf bear">&#10007; {ma:.1f} ({gap:+.1f})</span></td>'
+
+
 def gap_cell(gap: float) -> str:
     """Fast SMA vs slow SMA: above ✓ (green) or below ✗ (red), with the % gap."""
     if gap != gap:
@@ -494,28 +580,51 @@ def updated_html() -> str:
     return f'<div class="updated">Updated <time datetime="{now.isoformat(timespec="seconds")}">{label}</time></div>'
 
 
+def period_labels(dates: list[str]) -> tuple[list[str], list[int], list[str], list[int]]:
+    """Week labels (the Friday ending each week, as resample("W-FRI") names them) and month
+    labels ("YYYY-MM") covering the dates, plus each date's index into those lists."""
+    friday = pd.offsets.Week(weekday=4)
+    week_of = [friday.rollforward(pd.Timestamp(d)).strftime("%Y-%m-%d") for d in dates]
+    month_of = [d[:7] for d in dates]
+    weeks, months = sorted(set(week_of)), sorted(set(month_of))
+    return weeks, [weeks.index(w) for w in week_of], months, [months.index(m) for m in month_of]
+
+
 def pack_details(details: dict[str, dict], companies: dict[str, str]) -> dict:
     """Compact chart data for every stock: prices as integer cents, the trend direction
     as a "+"/"-" string, and one shared date list (a stock keeps its own dates only if
     they differ from the shared ones). Decoded by getDetail() in the page."""
     dates = sorted({d for det in details.values() for d in det["d"]})[-DETAIL_BARS:]
     cents = lambda values: [None if v is None else round(v * 100) for v in values]
+    tenths = lambda values: [None if v is None or v != v else round(v * 10) for v in values]
+    weeks, week_idx, months, month_idx = period_labels(dates)
     stocks = {}
     for sym, det in sorted(details.items()):
         packed = {key: cents(det[key]) for key in ("o", "h", "l", "c", "cx", "st", "s3", "s9", "vw", "up")}
         packed["dir"] = "".join("+" if v == 1 else "-" for v in det["dir"])
+        # RSI as integer tenths: daily per candle; weekly/monthly per period (shared labels).
+        packed["rd"], packed["rdm"] = tenths(det.get("rd", [])), tenths(det.get("rdm", []))
+        own = det["d"] if det["d"] != dates[-len(det["d"]):] else None
+        w_labels, m_labels = (period_labels(own)[0], period_labels(own)[2]) if own else (weeks, months)
+        rw, rm = det.get("rw", {}), det.get("rm", {})
+        packed["rw"] = tenths([rw.get(w, (None, None))[0] for w in w_labels])
+        packed["rwm"] = tenths([rw.get(w, (None, None))[1] for w in w_labels])
+        packed["rm"] = tenths([rm.get(m, (None, None))[0] for m in m_labels])
+        packed["rmm"] = tenths([rm.get(m, (None, None))[1] for m in m_labels])
+        if own:
+            _, packed["wk"], _, packed["mo"] = period_labels(own)
         packed["close"] = round(det["close"] * 100)
         packed["chg"] = round(det["chg"] * 100)
         packed["n"] = companies.get(sym, "")
         if det["d"] != dates[-len(det["d"]):]:
             packed["d"] = det["d"]
         stocks[sym] = packed
-    return {"dates": dates, "stocks": stocks}
+    return {"dates": dates, "wk": week_idx, "mo": month_idx, "stocks": stocks}
 
 
 def render(
     signals: list[Signal], rising: list[Signal], flipped: list[Flipped], mtfs: list[MultiTimeframe],
-    smas: list[MultiTimeframe],
+    smas: list[MultiTimeframe], rsis: list[MultiTimeframe],
     details: dict[str, dict], companies: dict[str, str],
     history: dict[str, list[dict]], watched: int, total: int, bullish: int,
     as_of: str, period: int, multiplier: float, band: float,
@@ -590,6 +699,22 @@ def render(
     ]
     sma_all = sum(all(m.sma_conditions.values()) for m in smas)
 
+    rsi_rows = [
+        row(m.symbol, companies, [
+            stock_cell(m.symbol, companies),
+            num_cell(m.close, f"{m.close:,.2f}"),
+            change_cell(m.change_pct),
+            rsi_cell(m.rsi["d"]),
+            rsi_ma_cell(m.rsi["d"], m.rsi["d_ma"]),
+            rsi_cell(m.rsi["w"]),
+            rsi_ma_cell(m.rsi["w"], m.rsi["w_ma"]),
+            rsi_cell(m.rsi["m"]),
+            rsi_ma_cell(m.rsi["m"], m.rsi["m_ma"]),
+        ], attrs="".join(f' data-{k}="{int(v)}"' for k, v in m.rsi_conditions.items()))
+        for m in rsis
+    ]
+    rsi_all = sum(all(m.rsi_conditions.values()) for m in rsis)
+
     series = [{"d": day, "n": len(stocks)} for day, stocks in sorted(history.items())]
     prev = series[-2]["n"] if len(series) > 1 else None
     delta = len(signals) - prev if prev is not None else 0
@@ -616,8 +741,11 @@ def render(
         "SIGNAL_ROWS": "\n".join(signal_rows),
         "MTF_ROWS": "\n".join(mtf_rows),
         "MTF_ALL": str(mtf_all),
+        "TV_LAYOUT": TRADINGVIEW_LAYOUT,
         "SMA_ROWS": "\n".join(sma_rows),
         "SMA_ALL": str(sma_all),
+        "RSI_ROWS": "\n".join(rsi_rows),
+        "RSI_ALL": str(rsi_all),
         # Embedded as JSON; escape "</" so it can't close the script tag.
         "DETAILS": json.dumps(pack_details(details, companies), separators=(",", ":")).replace("</", "<\\/"),
         "SYMBOL_OPTIONS": "".join(
@@ -698,7 +826,7 @@ body {
 }
 
 /* KPI tiles */
-.kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
 .kpi {
   background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
   padding: 14px 16px; text-align: left; font: inherit; color: inherit; min-width: 0;
@@ -849,7 +977,15 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 .dc .w-s100 { stroke-width: 1.25; }
 .dc .w-s200 { stroke-width: 3.5; opacity: .45; }
 .sma-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink); font-weight: 600; cursor: pointer; }
-.long-sma[hidden], .dlg-legend .ind[hidden] { display: none; }
+.long-sma[hidden], .dlg-legend .ind[hidden], .rsi-tf[hidden] { display: none; }
+.zoom.rsi-tf { margin-left: 0; }
+.dlg-chart.with-rsi { height: 580px; }
+.dc .pane-title { font-size: 11px; font-weight: 600; fill: var(--ink-2); }
+.dc .rsi-zone { fill: var(--ink); opacity: .035; }
+.dc .rsi-level { stroke: var(--axis); stroke-width: 1; stroke-dasharray: 4 3; }
+.dc .w-rsi { stroke-width: 2; }
+.dc .w-rsima { stroke-width: 1.5; stroke-dasharray: 5 3; }
+@media (max-width: 700px) { .dlg-chart.with-rsi { height: 480px; } }
 .dc .end { font-size: 11px; font-weight: 600; fill: var(--ink-2); }
 .mk-up { fill: var(--up); stroke: var(--surface); stroke-width: 2; }
 .mk-down { fill: var(--down); stroke: var(--surface); stroke-width: 2; }
@@ -913,11 +1049,6 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <div class="kpi-value">%%RISING%%</div>
       <div class="kpi-foot">ST, SMA 3 and SMA 9 rising</div>
     </button>
-    <button class="kpi" data-tab="signals">
-      <div class="kpi-label">Above VWAP Band</div>
-      <div class="kpi-value">%%COUNT%%</div>
-      <div class="kpi-foot">%%DELTA%%</div>
-    </button>
     <button class="kpi" data-tab="mtf">
       <div class="kpi-label">Multi-Timeframe Rising</div>
       <div class="kpi-value">%%MTF_ALL%%</div>
@@ -928,15 +1059,26 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       <div class="kpi-value">%%SMA_ALL%%</div>
       <div class="kpi-foot">All gaining &amp; stacked 3 &gt; &hellip; &gt; 200</div>
     </button>
+    <button class="kpi" data-tab="rsi">
+      <div class="kpi-label">RSI 70</div>
+      <div class="kpi-value">%%RSI_ALL%%</div>
+      <div class="kpi-foot">D, W &amp; M RSI &gt; 70 and &gt; its SMA</div>
+    </button>
+    <button class="kpi" data-tab="signals">
+      <div class="kpi-label">Above VWAP Band</div>
+      <div class="kpi-value">%%COUNT%%</div>
+      <div class="kpi-foot">%%DELTA%%</div>
+    </button>
   </section>
 
   <div class="main">
     <nav class="tabs" role="tablist" aria-orientation="vertical" aria-label="Lists">
       <button class="tab" role="tab" id="tab-flipped" aria-controls="panel-flipped" aria-selected="true">Bullish Re-entry <span class="count">%%FLIPPED%%</span></button>
       <button class="tab" role="tab" id="tab-rising" aria-controls="panel-rising" aria-selected="false" tabindex="-1">Above VWAP &middot; Rising <span class="count">%%RISING%%</span></button>
-      <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Above VWAP Band <span class="count">%%COUNT%%</span></button>
       <button class="tab" role="tab" id="tab-mtf" aria-controls="panel-mtf" aria-selected="false" tabindex="-1">Multi-Timeframe Rising <span class="count" id="mtf-count">%%MTF_ALL%%</span></button>
       <button class="tab" role="tab" id="tab-sma" aria-controls="panel-sma" aria-selected="false" tabindex="-1">SMA Gaining <span class="count" id="sma-count">%%SMA_ALL%%</span></button>
+      <button class="tab" role="tab" id="tab-rsi" aria-controls="panel-rsi" aria-selected="false" tabindex="-1">RSI 70 <span class="count" id="rsi-count">%%RSI_ALL%%</span></button>
+      <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Above VWAP Band <span class="count">%%COUNT%%</span></button>
     </nav>
 
     <div>
@@ -993,29 +1135,6 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
         </div>
       </section>
 
-      <section class="card panel" role="tabpanel" id="panel-signals" aria-labelledby="tab-signals" hidden>
-        <div class="panel-head">
-          <h2>Above VWAP Band</h2>
-          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
-          <label class="toggle"><input type="checkbox" class="fresh-only"> New (%%FRESH%%)</label>
-          <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
-        </div>
-        <div class="table-wrap">
-          <table data-sort="3">
-            <thead><tr>
-              <th data-type="text">Stock</th>
-              <th class="num" data-type="num">Close</th>
-              <th class="num" data-type="num">Day</th>
-              <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
-              <th>Last 40 candles</th>
-            </tr></thead>
-            <tbody>
-%%SIGNAL_ROWS%%
-            </tbody>
-          </table>
-          <div class="empty" hidden>No stocks</div>
-        </div>
-      </section>
 
       <section class="card panel" role="tabpanel" id="panel-mtf" aria-labelledby="tab-mtf" data-count="mtf-count" hidden>
         <div class="panel-head">
@@ -1095,6 +1214,68 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
           <div class="empty" hidden>No stocks</div>
         </div>
       </section>
+
+      <section class="card panel" role="tabpanel" id="panel-rsi" aria-labelledby="tab-rsi" data-count="rsi-count" hidden>
+        <div class="panel-head">
+          <h2>RSI 70</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <fieldset class="tf-filter">
+            <legend>RSI &gt; 70</legend>
+            <label><input type="checkbox" class="tf-check" value="rd" checked> Daily</label>
+            <label><input type="checkbox" class="tf-check" value="rw" checked> Weekly</label>
+            <label><input type="checkbox" class="tf-check" value="rm" checked> Monthly</label>
+          </fieldset>
+          <fieldset class="tf-filter">
+            <legend>RSI &gt; SMA of RSI</legend>
+            <label><input type="checkbox" class="tf-check" value="md" checked> Daily</label>
+            <label><input type="checkbox" class="tf-check" value="mw" checked> Weekly</label>
+            <label><input type="checkbox" class="tf-check" value="mm" checked> Monthly</label>
+          </fieldset>
+        </div>
+        <div class="table-wrap">
+          <table data-sort="0">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="RSI 14 of daily Heikin Ashi close">Daily RSI</th>
+              <th class="num" data-type="num" title="SMA 14 of daily RSI, and RSI minus that SMA">Daily RSI SMA</th>
+              <th class="num" data-type="num" title="RSI 14 of weekly Heikin Ashi close (current week in progress)">Weekly RSI</th>
+              <th class="num" data-type="num" title="SMA 14 of weekly RSI, and RSI minus that SMA">Weekly RSI SMA</th>
+              <th class="num" data-type="num" title="RSI 14 of monthly Heikin Ashi close (current month in progress)">Monthly RSI</th>
+              <th class="num" data-type="num" title="SMA 14 of monthly RSI, and RSI minus that SMA">Monthly RSI SMA</th>
+            </tr></thead>
+            <tbody>
+%%RSI_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
+      </section>
+
+      <section class="card panel" role="tabpanel" id="panel-signals" aria-labelledby="tab-signals" hidden>
+        <div class="panel-head">
+          <h2>Above VWAP Band</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <label class="toggle"><input type="checkbox" class="fresh-only"> New (%%FRESH%%)</label>
+          <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
+        </div>
+        <div class="table-wrap">
+          <table data-sort="3">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
+              <th>Last 40 candles</th>
+            </tr></thead>
+            <tbody>
+%%SIGNAL_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -1105,7 +1286,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     <div class="dlg-title"><h3 id="detail-symbol"></h3><span id="detail-name"></span></div>
     <div class="dlg-price"><span id="detail-close"></span><span class="pill" id="detail-chg"></span></div>
     <div class="dlg-actions">
-      <a class="dlg-link" id="detail-link" target="_blank" rel="noopener">Yahoo Finance &#8599;</a>
+      <a class="dlg-link" id="detail-link" target="_blank" rel="noopener">TradingView &#8599;</a>
       <button class="dlg-close" id="detail-close-btn" aria-label="Close" autofocus>&times;</button>
     </div>
   </div>
@@ -1125,6 +1306,10 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     <span class="ind"><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-up"/></svg>Cross above</span>
     <span class="ind"><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-down"/></svg>Cross below</span>
     <label class="sma-toggle"><input type="checkbox" id="show-smas"> All SMAs</label>
+    <label class="sma-toggle"><input type="checkbox" id="show-rsi"> RSI</label>
+    <div class="zoom rsi-tf" role="group" aria-label="RSI timeframe" hidden>
+      <button type="button" data-tf="D" aria-pressed="true">D</button><button type="button" data-tf="W">W</button><button type="button" data-tf="M">M</button>
+    </div>
     <div class="zoom" role="group" aria-label="Range">
       <button type="button" data-span="40">40D</button><button type="button" data-span="90">90D</button><button type="button" data-span="180">180D</button>
     </div>
@@ -1232,6 +1417,24 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     return out;
   }
   let showAllSmas = false;
+  let showRsi = false, rsiTf = "D";
+  // RSI per candle for each timeframe: {v, ma, upV, upMa}. Weekly/monthly values repeat for
+  // every day of their period; "rising" compares with the previous day (D) or period (W, M).
+  function decodeRsi(r, len) {
+    const t = a => (a || []).map(v => v == null ? null : v / 10);
+    const rose = (a, i) => i > 0 && a[i] != null && a[i - 1] != null && a[i] > a[i - 1];
+    const dv = t(r.rd), dm = t(r.rdm);
+    const out = {D: {v: dv, ma: dm, upV: dv.map((_, i) => rose(dv, i)), upMa: dm.map((_, i) => rose(dm, i))}};
+    for (const [tf, vals, mas, idx] of [["W", r.rw, r.rwm, r.wk || RAW.wk.slice(RAW.wk.length - len)],
+                                         ["M", r.rm, r.rmm, r.mo || RAW.mo.slice(RAW.mo.length - len)]]) {
+      const pv = t(vals), pm = t(mas);
+      out[tf] = {
+        v: idx.map(k => pv[k] ?? null), ma: idx.map(k => pm[k] ?? null),
+        upV: idx.map(k => rose(pv, k)), upMa: idx.map(k => rose(pm, k)),
+      };
+    }
+    return out;
+  }
   function getDetail(sym) {
     if (DETAILS[sym]) return DETAILS[sym];
     const r = RAW.stocks[sym];
@@ -1242,6 +1445,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
       d: r.d || RAW.dates.slice(RAW.dates.length - len),
       o: f(r.o), h: f(r.h), l: f(r.l), c: f(r.c), st: f(r.st), s3: f(r.s3), s9: f(r.s9), vw: f(r.vw), up: f(r.up),
       ...longSmas(f(r.cx || []), f(r.c)),
+      rsi: decodeRsi(r, len),
       dir: [...r.dir].map(ch => ch === "+" ? 1 : -1),
       close: r.close / 100, chg: r.chg / 100, name: r.n,
     };
@@ -1255,7 +1459,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
   const scroller = document.getElementById("detail-scroll");
   let syncingScroll = false;
   const MIN_SPAN = 20;
-  const zoomButtons = [...document.querySelectorAll(".zoom button")];
+  const zoomButtons = [...document.querySelectorAll(".zoom button[data-span]")];  // not the RSI D/W/M buttons
 
   function el(name, attrs, parent) {
     const node = document.createElementNS(NS, name);
@@ -1282,7 +1486,8 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     const chg = document.getElementById("detail-chg");
     chg.textContent = (b.chg >= 0 ? "+" : "") + b.chg.toFixed(2) + "%";
     chg.className = "pill " + (b.chg >= 0 ? "up" : "down");
-    document.getElementById("detail-link").href = "https://finance.yahoo.com/quote/" + encodeURIComponent(sym);
+    document.getElementById("detail-link").href =
+      "https://www.tradingview.com/chart/%%TV_LAYOUT%%/?symbol=" + encodeURIComponent(sym.replace(/-/g, "."));
     span = Math.min(40, b.d.length);
     end = b.d.length;
     dlg.showModal();
@@ -1300,14 +1505,20 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     zoomButtons.forEach(z => z.setAttribute("aria-pressed", Number(z.dataset.span) === span));
     const W = chartHost.clientWidth - 16, H = chartHost.clientHeight - 16;
     const pad = {l: 56, r: 92, t: 12, b: 26};
-    const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b, step = iw / span;
+    const ihAll = H - pad.t - pad.b, rsiGap = 26, titleH = showRsi ? 16 : 0;
+    // With RSI on, the RSI pane comes first (top ~32%) and the price chart sits below it.
+    const rsiTop = pad.t + titleH;
+    const rsiH = showRsi ? Math.round((ihAll - titleH - rsiGap) * 0.32) : 0;
+    const priceTop = showRsi ? rsiTop + rsiH + rsiGap : pad.t;
+    const ih = showRsi ? ihAll - titleH - rsiH - rsiGap : ihAll;
+    const iw = W - pad.l - pad.r, step = iw / span;
     const extra = showAllSmas ? LONG_SMAS.map(p => b["s" + p]) : [];
     const indicators = showAllSmas ? [] : [b.st, b.up, b.vw];
     const all = [b.h, b.l, b.s3, b.s9, ...indicators, ...extra].flatMap(a => a.slice(start, end)).filter(v => v != null);
     let lo = Math.min(...all), hi = Math.max(...all);
     const margin = (hi - lo) * 0.04 || 1; lo -= margin; hi += margin;
     const x = i => pad.l + (i - start + 0.5) * step;
-    const y = v => pad.t + ((hi - v) / (hi - lo)) * ih;
+    const y = v => priceTop + ((hi - v) / (hi - lo)) * ih;
     const svg = el("svg", {class: "dc", viewBox: `0 0 ${W} ${H}`, tabindex: 0, role: "img",
       "aria-label": `${openSym}: last ${span} daily Heikin Ashi candles with Supertrend, SMA 3, SMA 9 and VWAP band`}, chartHost);
 
@@ -1320,7 +1531,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     for (let i = start; i < end; i += Math.ceil(span / 6)) {
       el("text", {x: x(i), y: H - 6, "text-anchor": "middle", class: "tick"}, svg).textContent = shortDate(b.d[i]);
     }
-    const hl = el("rect", {y: pad.t, height: ih, width: step, class: "hl", visibility: "hidden"}, svg);
+    const hl = el("rect", {y: pad.t, height: ihAll, width: step, class: "hl", visibility: "hidden"}, svg);
 
     // VWAP band (restarts each January, so break at a year change)
     const sameYear = i => b.d[i].slice(0, 4) === b.d[i - 1].slice(0, 4);
@@ -1391,18 +1602,48 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     for (let k = 1; k < labels.length; k++) labels[k].y = Math.max(labels[k].y, labels[k - 1].y + 13);
     for (const lab of labels) el("text", {x: W - pad.r + 8, y: lab.y + 4, class: "end"}, svg).textContent = lab.t;
 
+    // RSI pane (0-100 scale of its own, below the price pane)
+    const R = b.rsi[rsiTf];
+    if (showRsi) {
+      const yr = v => rsiTop + ((100 - v) / 100) * rsiH;
+      el("text", {x: pad.l, y: rsiTop - 10, class: "pane-title"}, svg).textContent =
+        `RSI 14 \u00b7 ${{D: "Daily", W: "Weekly", M: "Monthly"}[rsiTf]}`;
+      el("rect", {x: pad.l, y: yr(70), width: iw, height: yr(30) - yr(70), class: "rsi-zone"}, svg);
+      for (const v of [30, 50, 70]) {
+        el("line", {x1: pad.l, x2: W - pad.r, y1: yr(v), y2: yr(v), class: v === 50 ? "grid" : "rsi-level"}, svg);
+        el("text", {x: pad.l - 8, y: yr(v) + 4, "text-anchor": "end", class: "tick"}, svg).textContent = v;
+      }
+      const rsiLine = (values, rising, width) => {
+        const paths = {rise: "", flat: ""};
+        for (let i = start + 1; i < end; i++) {
+          if (values[i] == null || values[i - 1] == null) continue;
+          paths[rising[i] ? "rise" : "flat"] += `M${x(i - 1)},${yr(values[i - 1])}L${x(i)},${yr(values[i])}`;
+        }
+        for (const [kind, d] of Object.entries(paths)) if (d) el("path", {d, class: `seg ${kind} ${width}`}, svg);
+      };
+      rsiLine(R.ma, R.upMa, "w-rsima");
+      rsiLine(R.v, R.upV, "w-rsi");
+      const rl = [["RSI", R.v[last]], ["RSI SMA", R.ma[last]]].filter(([, v]) => v != null)
+        .map(([t, v]) => ({t, y: yr(v)})).sort((a, c) => a.y - c.y);
+      for (let k = 1; k < rl.length; k++) rl[k].y = Math.max(rl[k].y, rl[k - 1].y + 13);
+      for (const lab of rl) el("text", {x: W - pad.r + 8, y: lab.y + 4, class: "end"}, svg).textContent = lab.t;
+    }
+
     // Crosshair + readout
-    const cross = el("line", {y1: pad.t, y2: pad.t + ih, class: "cross", visibility: "hidden"}, svg);
+    const cross = el("line", {y1: pad.t, y2: pad.t + ihAll, class: "cross", visibility: "hidden"}, svg);
     const readout = document.getElementById("detail-readout");
     let idx = last;
     function items(i) {
       const up = (arr, extra) => i > 0 && arr[i] != null && arr[i - 1] != null && arr[i] > arr[i - 1] && (!extra || extra());
       return [
+        ...(showRsi ? [[`RSI (${rsiTf})`, R.v[i] == null ? "\u2014" : R.v[i].toFixed(1), R.upV[i]],
+                       ["RSI SMA", R.ma[i] == null ? "\u2014" : R.ma[i].toFixed(1), R.upMa[i]]] : []),
         ["O", money(b.o[i])], ["H", money(b.h[i])], ["L", money(b.l[i])], ["C", money(b.c[i])],
         ...(showAllSmas ? [] : [["Supertrend", money(b.st[i]), up(b.st, () => b.dir[i] === b.dir[i - 1])]]),
         ["SMA 3", money(b.s3[i]), up(b.s3)],
         ["SMA 9", money(b.s9[i]), up(b.s9)],
         ...(showAllSmas ? LONG_SMAS.map(p => ["SMA " + p, money(b["s" + p][i]), up(b["s" + p])]) : []),
+
         ...(showAllSmas ? [] : [["VWAP band", money(b.up[i])], ["VWAP", money(b.vw[i])]]),
       ];
     }
@@ -1489,6 +1730,19 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
   });
   zoomButtons.forEach(z => z.addEventListener("click", () => zoomTo(Number(z.dataset.span))));
   // "All SMAs" adds SMA 20/50/100/200; the choice is kept while the page is open.
+  // RSI pane toggle + timeframe; both choices are kept while the page is open.
+  const rsiTfGroup = document.querySelector(".rsi-tf");
+  document.getElementById("show-rsi").addEventListener("change", e => {
+    showRsi = e.target.checked;
+    rsiTfGroup.hidden = !showRsi;
+    chartHost.classList.toggle("with-rsi", showRsi);
+    if (openSym) drawDetail();
+  });
+  rsiTfGroup.querySelectorAll("button").forEach(btn => btn.addEventListener("click", () => {
+    rsiTf = btn.dataset.tf;
+    rsiTfGroup.querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", x === btn));
+    if (openSym) drawDetail();
+  }));
   document.getElementById("show-smas").addEventListener("change", e => {
     showAllSmas = e.target.checked;
     document.querySelectorAll(".long-sma").forEach(el => { el.hidden = !showAllSmas; });
@@ -1666,6 +1920,7 @@ ALERT_LISTS = {
     "dwm": "Multi-Timeframe Rising",
     "above": "Above VWAP Band",
     "sma": "SMA Gaining",
+    "rsi": "RSI 70",
 }
 
 
@@ -1726,7 +1981,7 @@ def write_alert_email(
             text.append(f"  {sym:<6} {name[:32]:<32} {close:>10} {chg:>8}")
             parts.append(
                 '<tr style="border-bottom:1px solid #f0efec">'
-                f'<td><a href="https://finance.yahoo.com/quote/{html.escape(sym)}" '
+                f'<td><a href="{html.escape(tradingview_url(sym))}" '
                 f'style="color:#2a78d6;font-weight:700;text-decoration:none">{html.escape(sym)}</a></td>'
                 f"<td>{html.escape(name)}</td>"
                 f'<td style="text-align:right">{close}</td>'
@@ -1760,7 +2015,7 @@ def main() -> int:
     parser.add_argument(
         "--alert-file",
         type=Path,
-        help="write an alert email here (plain text, plus .html) when stocks newly join Bullish Re-entry, Multi-Timeframe Rising, Above VWAP Band or SMA Gaining",
+        help="write an alert email here (plain text, plus .html) when stocks newly join Bullish Re-entry, Multi-Timeframe Rising, Above VWAP Band, SMA Gaining or RSI 70",
     )
     parser.add_argument(
         "--backfill",
@@ -1813,8 +2068,12 @@ def main() -> int:
     smas = sorted(
         (r.mtf for r in current if r.mtf and any(r.mtf.sma_conditions.values())), key=lambda m: m.symbol
     )
+    # Stocks meeting at least one RSI condition; the page filters further.
+    rsis = sorted(
+        (r.mtf for r in current if r.mtf and any(r.mtf.rsi_conditions.values())), key=lambda m: m.symbol
+    )
     page = render(
-        signals, rising, flipped, mtfs, smas, details, companies, history, watched, len(current), bullish,
+        signals, rising, flipped, mtfs, smas, rsis, details, companies, history, watched, len(current), bullish,
         as_of, args.period, args.multiplier, args.vwap_band,
     )
     args.output.write_text(page, encoding="utf-8")
@@ -1825,6 +2084,8 @@ def main() -> int:
         "above": sorted(s.symbol for s in signals),
         # SMA Gaining with its default filters: all six SMAs gaining and stacked 3 > 9 > 20 > 50 > 100 > 200.
         "sma": [m.symbol for m in smas if all(m.sma_conditions.values())],
+        # RSI 70 with its default filters: daily, weekly and monthly RSI above 70 and above their SMA.
+        "rsi": [m.symbol for m in rsis if all(m.rsi_conditions.values())],
     }
     new = update_alerts(
         lists, args.data_dir / "alerts_state.json", args.alert_file, details, companies, as_of
