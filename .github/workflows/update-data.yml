@@ -2,11 +2,13 @@ name: Update S&P 500 data
 
 on:
   schedule:
-    # Weekdays at 10 AM, 12 PM, 3 PM and 5 PM US Eastern. GitHub cron is UTC-only, so both
+    # Weekdays at 10:07 AM, 12:07 PM, 3:07 PM and 5:07 PM US Eastern. Minute 7, not 0: GitHub
+    # delays and sometimes drops scheduled runs at the top of the hour, its busiest time.
+    # GitHub cron is UTC-only, so both
     # the standard-time and daylight-time UTC hours are listed; the "eastern-time" job
     # below lets through only the set that matches New York's current offset.
-    - cron: "0 15,17,20,22 * * 1-5"  # EST (UTC-5): 10 AM, 12 PM, 3 PM, 5 PM
-    - cron: "0 14,16,19,21 * * 1-5"  # EDT (UTC-4): 10 AM, 12 PM, 3 PM, 5 PM
+    - cron: "7 15,17,20,22 * * 1-5"  # EST (UTC-5): 10:07 AM, 12:07, 3:07 and 5:07 PM
+    - cron: "7 14,16,19,21 * * 1-5"  # EDT (UTC-4): 10:07 AM, 12:07, 3:07 and 5:07 PM
   workflow_dispatch: # on-demand run from the Actions tab
     inputs:
       full:
@@ -35,8 +37,8 @@ jobs:
         run: |
           zone=$(TZ=America/New_York date +%Z)   # EST or EDT
           case "$SCHEDULE" in
-            "0 15,17,20,22 * * 1-5") want=EST ;;
-            "0 14,16,19,21 * * 1-5") want=EDT ;;
+            "7 15,17,20,22 * * 1-5") want=EST ;;
+            "7 14,16,19,21 * * 1-5") want=EDT ;;
             *) want="" ;;
           esac
           if [ "$EVENT" != "schedule" ] || [ "$zone" = "$want" ]; then
