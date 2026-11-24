@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import ssl
 import time
 import urllib.request
@@ -21,8 +22,8 @@ yf.config.debug.hide_exceptions = False
 CONSTITUENTS_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
 
-def get_symbols() -> list[str]:
-    """Fetch the current S&P 500 constituents and return Yahoo Finance symbols."""
+def get_constituents() -> dict[str, str]:
+    """Fetch the current S&P 500 constituents as {Yahoo Finance symbol: company name}."""
     # Use certifi's CA bundle: python.org macOS builds ship without system root
     # certificates, which causes CERTIFICATE_VERIFY_FAILED. Wikipedia also
     # rejects requests without a User-Agent.
@@ -32,10 +33,22 @@ def get_symbols() -> list[str]:
     )
     with urllib.request.urlopen(request, context=context, timeout=30) as response:
         html = response.read().decode("utf-8")
-    tables = pd.read_html(StringIO(html))
-    symbols = tables[0]["Symbol"].dropna().astype(str)
+    table = pd.read_html(StringIO(html))[0].dropna(subset=["Symbol"])
     # Yahoo Finance uses hyphens for share classes (e.g. BRK.B -> BRK-B).
-    return symbols.str.replace(".", "-", regex=False).tolist()
+    symbols = table["Symbol"].astype(str).str.replace(".", "-", regex=False)
+    return dict(zip(symbols, table["Security"].astype(str)))
+
+
+def get_symbols() -> list[str]:
+    """Fetch the current S&P 500 constituents and return Yahoo Finance symbols."""
+    return list(get_constituents())
+
+
+def save_companies(companies: dict[str, str], path: Path) -> None:
+    """Merge {symbol: name} into a JSON file, keeping names of past constituents."""
+    existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    existing.update(companies)
+    path.write_text(json.dumps(dict(sorted(existing.items())), indent=2) + "\n", encoding="utf-8")
 
 
 def fetch_history(symbol: str, start: str | None = None) -> pd.DataFrame:
@@ -130,10 +143,12 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        symbols = get_symbols()
+        companies = get_constituents()
     except Exception as exc:
         print(f"Could not retrieve the S&P 500 constituent list: {exc}")
         return 1
+    symbols = list(companies)
+    save_companies(companies, args.output_dir / "companies.json")
 
     print(f"Downloading historical data for {len(symbols)} S&P 500 symbols...")
     succeeded = 0
