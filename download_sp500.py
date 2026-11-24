@@ -14,6 +14,10 @@ import certifi
 import pandas as pd
 import yfinance as yf
 
+# Raise download errors instead of logging them and returning an empty frame,
+# so failed symbols are reported (replaces the deprecated raise_errors=True).
+yf.config.debug.hide_exceptions = False
+
 CONSTITUENTS_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
 
@@ -38,7 +42,7 @@ def fetch_history(symbol: str, start: str | None = None) -> pd.DataFrame:
     """Fetch price history from `start` (YYYY-MM-DD) to now, or all history if None."""
     kwargs = {"start": start} if start else {"period": "max"}
     return yf.Ticker(symbol).history(
-        auto_adjust=False, actions=True, raise_errors=True, **kwargs
+        auto_adjust=False, actions=True, **kwargs
     )
 
 
