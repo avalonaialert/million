@@ -16,7 +16,9 @@ import argparse
 import html
 import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -25,9 +27,13 @@ import pandas as pd
 # but their dependence on old bars fades quickly, so 400 bars is plenty.
 LOOKBACK_BARS = 400
 CHART_BARS = 40
+# Bars embedded for the pop-up chart: it opens on the last CHART_BARS and zooms out to this.
+DETAIL_BARS = 180
 # Skip symbols whose data stops this many days before the newest file
 # (e.g. companies that have left the index).
 STALE_DAYS = 7
+# Daily bars used to build weekly and monthly candles (~15 years).
+MTF_DAILY_BARS = 3800
 
 
 @dataclass
@@ -152,10 +158,10 @@ def mini_chart(
         )
         (up_path if c >= o else down_path).append(segment)
 
-    # Draw the Supertrend line only through the current (bullish) run, so it
-    # doesn't jump between the upper and lower bands.
+    # Draw the Supertrend line only through the current run, so it doesn't
+    # jump between the upper and lower bands.
     run_start = len(direction) - 1
-    while run_start > 0 and direction[run_start - 1] == 1:
+    while run_start > 0 and direction[run_start - 1] == direction[-1]:
         run_start -= 1
     def polyline(values: np.ndarray, start: int) -> str:
         return " ".join(
@@ -176,24 +182,95 @@ def mini_chart(
 
 
 @dataclass
+class TrendStep:
+    """Supertrend on one timeframe, latest bar versus the previous bar."""
+    state: str  # "up" rising, "flat" bullish but unchanged, "new" just flipped bullish, "bear", "na"
+    change_pct: float = float("nan")
+
+    @property
+    def rising(self) -> bool:
+        return self.state == "up"
+
+
+def trend_step(line: np.ndarray, direction: np.ndarray) -> TrendStep:
+    if len(line) < 2 or direction[-1] != 1:
+        return TrendStep("bear")
+    if direction[-2] != 1:
+        return TrendStep("new")
+    change = float((line[-1] / line[-2] - 1) * 100)
+    return TrendStep("up" if change > 0 else "flat", change)
+
+
+def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Daily OHLC rows -> weekly ("W-FRI") or monthly ("ME") bars; the last bar may be in progress."""
+    frame = df.set_index(pd.to_datetime(df["Date"].str[:10]))[["Open", "High", "Low", "Close"]]
+    bars = frame.resample(rule).agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+    return bars.dropna()
+
+
+@dataclass
+class MultiTimeframe:
+    symbol: str
+    close: float
+    change_pct: float
+    daily: TrendStep
+    weekly: TrendStep
+    monthly: TrendStep
+    chart: str
+
+    @property
+    def steps(self) -> dict[str, TrendStep]:
+        return {"d": self.daily, "w": self.weekly, "m": self.monthly}
+
+
+@dataclass
 class Result:
     last_date: str
     bullish: bool
     above_band: bool  # bullish and Supertrend > VWAP upper band
     signal: Signal | None  # set for every bullish stock
+    mtf: MultiTimeframe | None = None  # set when analyzed with multi=True
+    detail: dict | None = None  # last CHART_BARS bars for the pop-up chart (multi=True)
+
+
+def rounded(values) -> list[float | None]:
+    return [None if v != v else round(float(v), 2) for v in values]  # v != v is NaN
+
+
+def chart_detail(
+    dates: np.ndarray, ha: pd.DataFrame, line: np.ndarray, direction: np.ndarray,
+    sma3: np.ndarray, sma9: np.ndarray, vwap: np.ndarray, upper: np.ndarray, close: np.ndarray,
+) -> dict:
+    n = DETAIL_BARS
+    return {
+        "d": dates[-n:].tolist(),
+        "o": rounded(ha["open"].to_numpy()[-n:]),
+        "h": rounded(ha["high"].to_numpy()[-n:]),
+        "l": rounded(ha["low"].to_numpy()[-n:]),
+        "c": rounded(ha["close"].to_numpy()[-n:]),
+        "st": rounded(line[-n:]),
+        "dir": direction[-n:].tolist(),
+        "s3": rounded(sma3[-n:]),
+        "s9": rounded(sma9[-n:]),
+        "vw": rounded(vwap[-n:]),
+        "up": rounded(upper[-n:]),
+        "close": round(float(close[-1]), 2),
+        "chg": round(float((close[-1] / close[-2] - 1) * 100), 2),
+    }
 
 
 def load(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, usecols=["Date", "Open", "High", "Low", "Close", "Volume"]).dropna()
 
 
-def analyze(path: Path, period: int, multiplier: float, band: float) -> Result | None:
-    return analyze_frame(load(path), path.stem, period, multiplier, band)
+def analyze(path: Path, period: int, multiplier: float, band: float, multi: bool = False) -> Result | None:
+    return analyze_frame(load(path), path.stem, period, multiplier, band, multi)
 
 
 def analyze_frame(
-    df: pd.DataFrame, symbol: str, period: int, multiplier: float, band: float
+    df: pd.DataFrame, symbol: str, period: int, multiplier: float, band: float, multi: bool = False
 ) -> Result | None:
+    full = df
     df = df.tail(LOOKBACK_BARS)
     if len(df) < period + 2:
         return None
@@ -203,16 +280,35 @@ def analyze_frame(
     line, direction = supertrend(ha, period, multiplier)
     vwap, upper = yearly_vwap(ha, df["Volume"].to_numpy(dtype=float), years, band)
     last_date = dates[-1]
+    close = df["Close"].to_numpy()
+    sma3 = ha["close"].rolling(3).mean().to_numpy()
+    sma9 = ha["close"].rolling(9).mean().to_numpy()
+    mtf = None
+    detail = None
+    if multi:
+        detail = {"sym": symbol, **chart_detail(dates, ha, line, direction, sma3, sma9, vwap, upper, close)}
+        steps = {"daily": trend_step(line, direction)}
+        recent = full.tail(MTF_DAILY_BARS)
+        for name, rule in (("weekly", "W-FRI"), ("monthly", "ME")):
+            bars = resample(recent, rule)
+            if len(bars) < period + 2:
+                steps[name] = TrendStep("na")
+                continue
+            steps[name] = trend_step(*supertrend(heikin_ashi(bars), period, multiplier))
+        mtf = MultiTimeframe(
+            symbol=symbol,
+            close=float(close[-1]),
+            change_pct=float((close[-1] / close[-2] - 1) * 100),
+            chart=mini_chart(ha, line, direction, upper, years),
+            **steps,
+        )
     if direction[-1] != 1:
-        return Result(last_date, False, False, None)
+        return Result(last_date, False, False, None, mtf, detail)
     # NaN (e.g. no volume yet this year) compares False, so it never passes.
     above_band = bool(line[-1] > upper[-1])
 
     flips = np.flatnonzero(direction[:-1] != 1)
     flip_index = flips[-1] + 1 if len(flips) else period - 1
-    close = df["Close"].to_numpy()
-    sma3 = ha["close"].rolling(3).mean().to_numpy()
-    sma9 = ha["close"].rolling(9).mean().to_numpy()
     signal = Signal(
         symbol=symbol,
         date=last_date,
@@ -230,7 +326,7 @@ def analyze_frame(
         change_pct=float((close[-1] / close[-2] - 1) * 100),
         chart=mini_chart(ha, line, direction, upper, years),
     )
-    return Result(last_date, True, above_band, signal)
+    return Result(last_date, True, above_band, signal, mtf, detail)
 
 
 @dataclass
@@ -274,11 +370,13 @@ def find_rising(signals: list[Signal]) -> list[Signal]:
     ]
 
 
-def symbol_cell(symbol: str) -> str:
+def stock_cell(symbol: str, companies: dict[str, str]) -> str:
     sym = html.escape(symbol)
+    name = html.escape(companies.get(symbol, ""))
     return (
-        f'<td data-v="{sym}"><a href="https://finance.yahoo.com/quote/{sym}" '
-        f'target="_blank" rel="noopener">{sym}</a></td>'
+        f'<td class="stock" data-v="{sym}">'
+        f'<a href="https://finance.yahoo.com/quote/{sym}" target="_blank" rel="noopener">{sym}</a>'
+        f'<span title="{name}">{name}</span></td>'
     )
 
 
@@ -286,76 +384,175 @@ def num_cell(value: float, text: str, extra: str = "") -> str:
     return f'<td class="num{extra}" data-v="{value}">{text}</td>'
 
 
-def company_cell(symbol: str, companies: dict[str, str]) -> str:
-    name = html.escape(companies.get(symbol, ""))
-    return f'<td class="company" data-v="{name}" title="{name}">{name}</td>'
+def change_cell(value: float) -> str:
+    """Daily price change as a tinted pill (sign is always shown, not color alone)."""
+    tone = "up" if value >= 0 else "down"
+    return f'<td class="num" data-v="{value}"><span class="pill {tone}">{value:+.2f}%</span></td>'
 
 
-def price_cells(s: Signal) -> list[str]:
-    change_class = " pos" if s.change_pct >= 0 else " neg"
-    return [
-        num_cell(s.close, f"{s.close:,.2f}"),
-        num_cell(s.change_pct, f"{s.change_pct:+.2f}%", change_class),
-    ]
+def delta_cell(value: float) -> str:
+    return f'<td class="num delta" data-v="{value}">{value:+.2f}%</td>'
+
+
+def bars_cell(bars: int, scale: int) -> str:
+    """Trend age: the number plus a small bar scaled to the longest run on the page."""
+    width = max(4, round(min(bars, scale) / scale * 100)) if scale else 0
+    return (
+        f'<td class="num" data-v="{bars}"><span class="age">'
+        f'<span class="age-bar"><i style="width:{width}%"></i></span>{bars}</span></td>'
+    )
+
+
+def row(
+    symbol: str, companies: dict[str, str], cells: list[str], fresh: bool = False, attrs: str = ""
+) -> str:
+    search = html.escape(f"{symbol} {companies.get(symbol, '')}".upper())
+    cls = ' class="fresh"' if fresh else ""
+    return f'<tr{cls} data-search="{search}"{attrs}>{"".join(cells)}</tr>'
+
+
+TREND_LABELS = {"flat": ("Flat", -1), "new": ("New bull", -2), "bear": ("Bearish", -3), "na": ("&mdash;", -4)}
+
+
+def trend_cell(step: TrendStep) -> str:
+    """Supertrend change on one timeframe; non-rising states are labelled, not just colored."""
+    if step.rising:
+        return (
+            f'<td class="num" data-v="{step.change_pct}">'
+            f'<span class="tf up">&#9650; {step.change_pct:+.2f}%</span></td>'
+        )
+    label, rank = TREND_LABELS[step.state]
+    return f'<td class="num" data-v="{rank}"><span class="tf {step.state}">{label}</span></td>'
+
+
+def updated_html() -> str:
+    """'Updated <time>' in US Eastern time. Must stay on one line with class="updated"
+    (the GitHub workflow skips commits where only this line changed)."""
+    now = datetime.now(ZoneInfo("America/New_York"))
+    label = now.strftime("%b %-d, %Y, %-I:%M %p %Z")
+    return f'<div class="updated">Updated <time datetime="{now.isoformat(timespec="seconds")}">{label}</time></div>'
+
+
+def pack_details(details: dict[str, dict], companies: dict[str, str]) -> dict:
+    """Compact chart data for every stock: prices as integer cents, the trend direction
+    as a "+"/"-" string, and one shared date list (a stock keeps its own dates only if
+    they differ from the shared ones). Decoded by getDetail() in the page."""
+    dates = sorted({d for det in details.values() for d in det["d"]})[-DETAIL_BARS:]
+    cents = lambda values: [None if v is None else round(v * 100) for v in values]
+    stocks = {}
+    for sym, det in sorted(details.items()):
+        packed = {key: cents(det[key]) for key in ("o", "h", "l", "c", "st", "s3", "s9", "vw", "up")}
+        packed["dir"] = "".join("+" if v == 1 else "-" for v in det["dir"])
+        packed["close"] = round(det["close"] * 100)
+        packed["chg"] = round(det["chg"] * 100)
+        packed["n"] = companies.get(sym, "")
+        if det["d"] != dates[-len(det["d"]):]:
+            packed["d"] = det["d"]
+        stocks[sym] = packed
+    return {"dates": dates, "stocks": stocks}
 
 
 def render(
-    signals: list[Signal], rising: list[Signal], flipped: list[Flipped], companies: dict[str, str],
-    watched: int, total: int, bullish: int,
+    signals: list[Signal], rising: list[Signal], flipped: list[Flipped], mtfs: list[MultiTimeframe],
+    details: dict[str, dict], companies: dict[str, str],
+    history: dict[str, list[dict]], watched: int, total: int, bullish: int,
     as_of: str, period: int, multiplier: float, band: float,
 ) -> str:
-    signal_rows = []
-    for s in signals:
-        fresh = ' class="fresh"' if s.bars_in_trend <= 3 else ""
-        cells = [
-            symbol_cell(s.symbol), company_cell(s.symbol, companies), *price_cells(s),
-            num_cell(s.bars_in_trend, str(s.bars_in_trend)),
-            f"<td>{s.chart}</td>",
-        ]
-        signal_rows.append(f"<tr{fresh}>{''.join(cells)}</tr>")
+    everyone = signals + rising + [f.signal for f in flipped]
+    # Runs longer than ~3 months show as a full bar.
+    scale = min(max((s.bars_in_trend for s in everyone), default=1), 60)
 
-    rising_rows = []
-    for s in rising:
-        cells = [
-            symbol_cell(s.symbol), company_cell(s.symbol, companies), *price_cells(s),
-            num_cell(s.st_change_pct, f"{s.st_change_pct:+.2f}%", " pos"),
-            num_cell(s.sma3_change_pct, f"{s.sma3_change_pct:+.2f}%", " pos"),
-            num_cell(s.sma9_change_pct, f"{s.sma9_change_pct:+.2f}%", " pos"),
-            num_cell(s.bars_in_trend, str(s.bars_in_trend)),
-            f"<td>{s.chart}</td>",
-        ]
-        rising_rows.append(f"<tr>{''.join(cells)}</tr>")
-
-    flipped_rows = []
-    for f in flipped:
-        s = f.signal
-        cells = [
-            symbol_cell(s.symbol), company_cell(s.symbol, companies), *price_cells(s),
-            num_cell(s.st_change_pct, f"{s.st_change_pct:+.2f}%", " pos"),
-            num_cell(s.bars_in_trend, str(s.bars_in_trend)),
-            f'<td data-v="{f.first_listed}">{f.first_listed}</td>',
+    flipped_rows = [
+        row(f.signal.symbol, companies, [
+            stock_cell(f.signal.symbol, companies),
+            num_cell(f.signal.close, f"{f.signal.close:,.2f}"),
+            change_cell(f.signal.change_pct),
+            delta_cell(f.signal.st_change_pct),
+            bars_cell(f.signal.bars_in_trend, scale),
+            f'<td data-v="{f.first_listed}" class="date">{f.first_listed}</td>',
             num_cell(f.days_listed, str(f.days_listed)),
-            f'<td data-v="{int(f.in_today)}">{"Yes" if f.in_today else "No"}</td>',
-            f"<td>{s.chart}</td>",
-        ]
-        flipped_rows.append(f"<tr>{''.join(cells)}</tr>")
+            f'<td data-v="{int(f.in_today)}">'
+            + ('<span class="tag">Listed</span>' if f.in_today else '<span class="dim">&mdash;</span>')
+            + "</td>",
+            f'<td class="spark-cell">{f.signal.chart}</td>',
+        ])
+        for f in flipped
+    ]
+    rising_rows = [
+        row(s.symbol, companies, [
+            stock_cell(s.symbol, companies),
+            num_cell(s.close, f"{s.close:,.2f}"),
+            change_cell(s.change_pct),
+            delta_cell(s.st_change_pct),
+            delta_cell(s.sma3_change_pct),
+            delta_cell(s.sma9_change_pct),
+            bars_cell(s.bars_in_trend, scale),
+            f'<td class="spark-cell">{s.chart}</td>',
+        ])
+        for s in rising
+    ]
+    signal_rows = [
+        row(s.symbol, companies, [
+            stock_cell(s.symbol, companies),
+            num_cell(s.close, f"{s.close:,.2f}"),
+            change_cell(s.change_pct),
+            bars_cell(s.bars_in_trend, scale),
+            f'<td class="spark-cell">{s.chart}</td>',
+        ], fresh=s.bars_in_trend <= 3)
+        for s in signals
+    ]
 
-    return TEMPLATE.format(
-        count=len(signals),
-        flipped_count=len(flipped),
-        rising_count=len(rising),
-        watched=watched,
-        total=total,
-        bullish=bullish,
-        fresh=sum(s.bars_in_trend <= 3 for s in signals),
-        as_of=html.escape(as_of),
-        period=period,
-        multiplier=json.dumps(multiplier),
-        band=json.dumps(band),
-        signal_rows="\n".join(signal_rows),
-        flipped_rows="\n".join(flipped_rows),
-        rising_rows="\n".join(rising_rows),
-    )
+    mtf_rows = [
+        row(m.symbol, companies, [
+            stock_cell(m.symbol, companies),
+            num_cell(m.close, f"{m.close:,.2f}"),
+            change_cell(m.change_pct),
+            trend_cell(m.daily),
+            trend_cell(m.weekly),
+            trend_cell(m.monthly),
+            f'<td class="spark-cell">{m.chart}</td>',
+        ], attrs="".join(f' data-{k}="{int(v.rising)}"' for k, v in m.steps.items()))
+        for m in mtfs
+    ]
+    mtf_all = sum(all(v.rising for v in m.steps.values()) for m in mtfs)
+
+    series = [{"d": day, "n": len(stocks)} for day, stocks in sorted(history.items())]
+    prev = series[-2]["n"] if len(series) > 1 else None
+    delta = len(signals) - prev if prev is not None else 0
+    if prev is None:
+        delta_text = ""
+    elif delta:
+        arrow, tone = ("&#9650;", "up") if delta > 0 else ("&#9660;", "down")
+        delta_text = f'<span class="kpi-delta {tone}">{arrow} {abs(delta)} vs prior day</span>'
+    else:
+        delta_text = '<span class="kpi-delta flat">No change vs prior day</span>'
+    as_of_label = pd.Timestamp(as_of).strftime("%a, %b %-d %Y")
+
+    values = {
+        "AS_OF": html.escape(as_of_label),
+        "UPDATED": updated_html(),
+        "COUNT": str(len(signals)),
+        "DELTA": delta_text,
+        "RISING": str(len(rising)),
+        "FLIPPED": str(len(flipped)),
+        "WATCHED": str(watched),
+        "FRESH": str(sum(s.bars_in_trend <= 3 for s in signals)),
+        "FLIPPED_ROWS": "\n".join(flipped_rows),
+        "RISING_ROWS": "\n".join(rising_rows),
+        "SIGNAL_ROWS": "\n".join(signal_rows),
+        "MTF_ROWS": "\n".join(mtf_rows),
+        "MTF_ALL": str(mtf_all),
+        # Embedded as JSON; escape "</" so it can't close the script tag.
+        "DETAILS": json.dumps(pack_details(details, companies), separators=(",", ":")).replace("</", "<\\/"),
+        "SYMBOL_OPTIONS": "".join(
+            f'<option value="{html.escape(sym)}">{html.escape(companies.get(sym, ""))}</option>'
+            for sym in sorted(details)
+        ),
+    }
+    page = TEMPLATE
+    for key, value in values.items():
+        page = page.replace(f"%%{key}%%", value)
+    return page
 
 
 TEMPLATE = """<!doctype html>
@@ -363,279 +560,785 @@ TEMPLATE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Supertrend over VWAP</title>
+<title>Supertrend Monitor</title>
 <style>
-:root {{
-  --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66;
-  --line: #e4e4df; --accent: #1f7a4d; --up: #1f9d5c; --down: #d0473d;
-  --fresh: #eaf6ef; --st: #2b6cb0; --band: #b7791f; --tab-active: #e9f3ed;
+:root {
+  --page: #f4f4f1; --surface: #fcfcfb; --surface-2: #f0efec; --ring: rgba(11,11,11,0.10);
+  --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781; --grid: #e1e0d9; --axis: #c3c2b7;
+  --series: #2a78d6; --series-fill: rgba(42,120,214,0.12); --band: #eb6834;
+  --up: #0a7d32; --up-bg: rgba(12,163,12,0.12); --down: #c23434; --down-bg: rgba(208,59,59,0.12);
+  --candle-up: #1a9e4b; --candle-down: #d94545; --accent: #2a78d6; --fresh: rgba(42,120,214,0.06);
   color-scheme: light;
-}}
-@media (prefers-color-scheme: dark) {{
-  :root {{
-    --bg: #121412; --panel: #1a1d1a; --text: #e8e8e3; --muted: #9a9a92;
-    --line: #2c302c; --accent: #4cc38a; --up: #3fbf7a; --down: #ef6a5e;
-    --fresh: #18301f; --st: #6ea8f0; --band: #e0a84a; --tab-active: #1d2e23;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232322; --ring: rgba(255,255,255,0.10);
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+    --series: #3987e5; --series-fill: rgba(57,135,229,0.18); --band: #d95926;
+    --up: #34c46a; --up-bg: rgba(12,163,12,0.16); --down: #ef6a6a; --down-bg: rgba(230,103,103,0.16);
+    --candle-up: #2fb862; --candle-down: #e66767; --accent: #3987e5; --fresh: rgba(57,135,229,0.08);
     color-scheme: dark;
-  }}
-}}
-* {{ box-sizing: border-box; }}
-body {{
-  margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-}}
-.page {{ max-width: 1320px; margin: 0 auto; padding: 32px 16px 48px; }}
-h1 {{ font-size: 24px; margin: 0 0 4px; letter-spacing: -0.01em; }}
-.sub {{ color: var(--muted); margin: 0 0 24px; }}
-.layout {{ display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; align-items: start; }}
-.tabs {{ display: flex; flex-direction: column; gap: 4px; position: sticky; top: 16px; }}
-.tab {{
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232322; --ring: rgba(255,255,255,0.10);
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+  --series: #3987e5; --series-fill: rgba(57,135,229,0.18); --band: #d95926;
+  --up: #34c46a; --up-bg: rgba(12,163,12,0.16); --down: #ef6a6a; --down-bg: rgba(230,103,103,0.16);
+  --candle-up: #2fb862; --candle-down: #e66767; --accent: #3987e5; --fresh: rgba(57,135,229,0.08);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.wrap { max-width: 1280px; margin: 0 auto; padding: 0 16px 40px; }
+
+/* Top bar */
+.topbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+  padding: 20px 0 18px; border-bottom: 1px solid var(--grid); margin-bottom: 20px;
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
+.brand svg { width: 22px; height: 22px; color: var(--accent); }
+.asof { color: var(--ink-2); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.asof::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--up); }
+.updated { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.lookup { margin-left: auto; position: relative; display: flex; align-items: center; }
+.lookup input {
+  width: 280px; max-width: 100%; padding: 8px 34px 8px 32px; border-radius: 9px; border: 1px solid var(--ring);
+  background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none' stroke='%23898781' stroke-width='2'%3E%3Ccircle cx='6' cy='6' r='4.5'/%3E%3Cpath d='m9.5 9.5 3 3'/%3E%3C/svg%3E") no-repeat 11px center;
+  color: var(--ink); font: inherit; font-size: 13px;
+}
+.lookup input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--fresh); }
+.lookup kbd {
+  position: absolute; right: 9px; font: 11px/1 system-ui, sans-serif; color: var(--muted);
+  border: 1px solid var(--ring); border-radius: 4px; padding: 2px 5px; pointer-events: none;
+}
+.lookup-msg {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 5; white-space: nowrap; font-size: 12px;
+  color: var(--down); background: var(--surface); border: 1px solid var(--ring); border-radius: 8px; padding: 6px 10px;
+}
+
+/* KPI tiles */
+.kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.kpi {
+  background: var(--surface); border: 1px solid var(--ring); border-radius: 12px;
+  padding: 14px 16px; text-align: left; font: inherit; color: inherit; min-width: 0;
+}
+button.kpi { cursor: pointer; transition: border-color .15s, transform .15s; }
+button.kpi:hover { border-color: var(--accent); }
+button.kpi[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.kpi-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+.kpi-value { font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 4px 0 2px; }
+.kpi-value small { font-size: 14px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+.kpi-foot { color: var(--muted); font-size: 12px; min-height: 16px; }
+.kpi-delta.up { color: var(--up); } .kpi-delta.down { color: var(--down); } .kpi-delta.flat { color: var(--muted); }
+
+/* History chart */
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 12px; }
+
+/* Tabs + table */
+.main { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; align-items: start; }
+.tabs { display: flex; flex-direction: column; gap: 4px; position: sticky; top: 16px; }
+.tab {
   display: flex; justify-content: space-between; align-items: center; gap: 8px;
-  padding: 10px 12px; border: 1px solid transparent; border-radius: 8px; background: none;
-  color: var(--muted); font: inherit; font-weight: 600; text-align: left; cursor: pointer;
-}}
-.tab:hover {{ color: var(--text); background: var(--panel); }}
-.tab[aria-selected=true] {{ color: var(--text); background: var(--tab-active); border-color: var(--line); }}
-.tab .badge {{
-  font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted);
-  background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 0 8px;
-}}
-@media (max-width: 760px) {{
-  .layout {{ grid-template-columns: minmax(0, 1fr); gap: 16px; }}
-  .tabs {{ flex-direction: row; flex-wrap: wrap; position: static; }}
-  .tab {{ flex: 1 1 160px; }}
-}}
-.desc {{ color: var(--muted); margin: 0 0 16px; }}
-.stats {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }}
-.stat {{
-  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-  padding: 12px 16px; min-width: 140px; flex: 1 1 140px;
-}}
-.stat b {{ display: block; font-size: 22px; font-variant-numeric: tabular-nums; }}
-.stat span {{ color: var(--muted); font-size: 12px; }}
-.tools {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }}
-input[type=search] {{
-  flex: 1 1 220px; max-width: 320px; padding: 8px 12px; border-radius: 8px;
-  border: 1px solid var(--line); background: var(--panel); color: var(--text); font: inherit;
-}}
-label {{ color: var(--muted); display: flex; gap: 6px; align-items: center; }}
-.table-wrap {{
-  overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-}}
-table {{ border-collapse: collapse; width: 100%; min-width: 820px; }}
-th, td {{ padding: 8px 12px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }}
-tbody tr:last-child td {{ border-bottom: 0; }}
-th {{
-  position: sticky; top: 0; background: var(--panel); font-size: 12px; font-weight: 600;
-  color: var(--muted); user-select: none;
-}}
-th[data-type] {{ cursor: pointer; }}
-th[aria-sort=ascending]::after {{ content: " \\25B2"; }}
-th[aria-sort=descending]::after {{ content: " \\25BC"; }}
-td.company {{ max-width: 240px; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }}
-td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-td a {{ color: var(--text); font-weight: 600; text-decoration: none; }}
-td a:hover {{ color: var(--accent); text-decoration: underline; }}
-tr.fresh td {{ background: var(--fresh); }}
-tr.fresh td:first-child a::after {{
-  content: "new"; margin-left: 6px; font-size: 10px; font-weight: 600; color: var(--accent);
-  border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; vertical-align: 1px;
-}}
-.pos {{ color: var(--up); }} .neg {{ color: var(--down); }}
-.spark {{ width: 160px; height: 40px; display: block; }}
-.spark .up {{ fill: var(--up); stroke: var(--up); stroke-width: 1; }}
-.spark .down {{ fill: var(--down); stroke: var(--down); stroke-width: 1; }}
-.spark .st {{ fill: none; stroke: var(--st); stroke-width: 1.5; stroke-dasharray: 3 2; }}
-.spark .band {{ fill: none; stroke: var(--band); stroke-width: 1.5; }}
-.legend {{ display: inline-flex; gap: 14px; color: var(--muted); font-size: 12px; margin-left: auto; }}
-.legend i {{ display: inline-block; width: 14px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }}
-.empty {{ padding: 32px; text-align: center; color: var(--muted); }}
-footer {{ color: var(--muted); font-size: 12px; margin-top: 16px; }}
+  padding: 10px 12px; border-radius: 8px; border: 1px solid transparent; background: none;
+  color: var(--ink-2); font: inherit; font-weight: 600; text-align: left; cursor: pointer;
+}
+.tab:hover { background: var(--surface); color: var(--ink); }
+.tab[aria-selected="true"] { background: var(--surface); color: var(--ink); border-color: var(--ring); box-shadow: inset 3px 0 0 var(--accent); }
+.tab .count {
+  font-size: 12px; font-variant-numeric: tabular-nums; color: var(--ink-2);
+  background: var(--surface-2); border-radius: 999px; padding: 1px 8px;
+}
+.tab[aria-selected="true"] .count { background: var(--accent); color: #fff; }
+
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 16px; border-bottom: 1px solid var(--grid); }
+.panel-head h2 { font-size: 15px; margin: 0; }
+.legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-left: auto; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 16px; height: 0; border-top: 2px solid; }
+.search {
+  width: 220px; max-width: 100%; padding: 7px 10px 7px 30px; border-radius: 8px; border: 1px solid var(--ring);
+  background: var(--page) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none' stroke='%23898781' stroke-width='2'%3E%3Ccircle cx='6' cy='6' r='4.5'/%3E%3Cpath d='m9.5 9.5 3 3'/%3E%3C/svg%3E") no-repeat 10px center;
+  color: var(--ink); font: inherit; font-size: 13px;
+}
+.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 12px; cursor: pointer; }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; min-width: 640px; }
+th, td { padding: 9px 14px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: var(--surface-2); }
+th {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); user-select: none; position: sticky; top: 0; background: var(--surface);
+}
+th[data-type] { cursor: pointer; }
+th[data-type]:hover { color: var(--ink); }
+th[aria-sort="ascending"]::after { content: " \\25B2"; font-size: 9px; }
+th[aria-sort="descending"]::after { content: " \\25BC"; font-size: 9px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.stock a { color: var(--ink); font-weight: 700; text-decoration: none; display: block; }
+.stock a:hover { color: var(--accent); }
+.stock span { display: block; color: var(--muted); font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+tr.fresh td { background: var(--fresh); }
+tr.fresh .stock a::after {
+  content: "NEW"; margin-left: 6px; font-size: 9px; font-weight: 700; letter-spacing: .05em;
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; vertical-align: 2px;
+}
+.pill { display: inline-block; min-width: 64px; padding: 2px 8px; border-radius: 6px; font-weight: 600; font-size: 12px; }
+.pill.up { color: var(--up); background: var(--up-bg); }
+.pill.down { color: var(--down); background: var(--down-bg); }
+.delta { color: var(--up); font-weight: 600; }
+.age { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.age-bar { width: 56px; height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
+.age-bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.date { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.tag { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--fresh); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; }
+.dim { color: var(--muted); }
+.spark-cell { padding-top: 4px; padding-bottom: 4px; }
+.spark { width: 168px; height: 42px; display: block; }
+.spark .up { fill: var(--candle-up); stroke: var(--candle-up); stroke-width: 1; }
+.spark .down { fill: var(--candle-down); stroke: var(--candle-down); stroke-width: 1; }
+.spark .st { fill: none; stroke: var(--series); stroke-width: 1.5; stroke-dasharray: 3 2; }
+.spark .band { fill: none; stroke: var(--band); stroke-width: 1.5; }
+.tf { display: inline-block; min-width: 84px; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+.tf.up { color: var(--up); background: var(--up-bg); }
+.tf.flat, .tf.new, .tf.na { color: var(--ink-2); background: var(--surface-2); }
+.tf.bear { color: var(--down); background: var(--down-bg); }
+.tf-filter { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; border: 0; padding: 0; margin: 0; }
+.tf-filter legend { float: left; padding: 0; margin-right: 4px; color: var(--muted); font-size: 12px; }
+.tf-filter label { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; color: var(--ink-2); cursor: pointer; }
+.empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+
+/* Stock detail pop-up */
+.stock a, .spark-cell { cursor: pointer; }
+.spark-cell:hover .spark { opacity: .8; }
+dialog.detail {
+  width: min(1000px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--ring);
+  border-radius: 14px; background: var(--surface); color: var(--ink); box-shadow: 0 24px 64px rgba(0,0,0,.35);
+}
+dialog.detail::backdrop { background: rgba(0,0,0,.55); }
+.dlg-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 16px 20px 12px; border-bottom: 1px solid var(--grid); }
+.dlg-title { display: flex; flex-direction: column; min-width: 0; }
+.dlg-title h3 { margin: 0; font-size: 20px; letter-spacing: -0.01em; }
+.dlg-title span { color: var(--muted); font-size: 13px; }
+.dlg-price { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dlg-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.dlg-link { color: var(--accent); font-size: 13px; font-weight: 600; text-decoration: none; padding: 6px 10px; border-radius: 8px; }
+.dlg-link:hover { background: var(--surface-2); }
+.dlg-close {
+  width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--ring); background: var(--surface);
+  color: var(--ink-2); font-size: 20px; line-height: 1; cursor: pointer;
+}
+.dlg-close:hover { background: var(--surface-2); color: var(--ink); }
+.dlg-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 12px 20px 0; color: var(--ink-2); font-size: 12px; }
+.dlg-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.dlg-legend svg { width: 26px; height: 8px; overflow: visible; }
+.dlg-legend .sep { width: 1px; height: 14px; background: var(--grid); }
+.zoom { margin-left: auto; display: inline-flex; border: 1px solid var(--ring); border-radius: 8px; overflow: hidden; }
+.zoom button {
+  border: 0; background: none; color: var(--ink-2); font: inherit; font-size: 12px; font-weight: 600;
+  padding: 4px 10px; cursor: pointer; font-variant-numeric: tabular-nums;
+}
+.zoom button + button { border-left: 1px solid var(--ring); }
+.zoom button:hover { background: var(--surface-2); color: var(--ink); }
+.zoom button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.dlg-chart { position: relative; height: 400px; padding: 4px 8px 12px; }
+.dlg-chart svg { display: block; width: 100%; height: 100%; }
+.dlg-chart svg:focus { outline: none; }
+.dlg-chart svg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+.dc .grid { stroke: var(--grid); stroke-width: 1; }
+.dc .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dc .c-up { fill: var(--candle-up); stroke: var(--candle-up); }
+.dc .c-down { fill: var(--candle-down); stroke: var(--candle-down); }
+.dc .candles { opacity: .55; }
+.dc .band-fill { fill: var(--band); opacity: .08; }
+.dc .band { fill: none; stroke: var(--band); stroke-width: 1.5; }
+.dc .vwap { fill: none; stroke: var(--band); stroke-width: 1; stroke-dasharray: 2 3; }
+.dc .seg { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.dc .rise { stroke: var(--up); }
+.dc .flat { stroke: var(--muted); }
+.dc .w-st { stroke-width: 2.75; }
+.dc .w-s3 { stroke-width: 1.75; stroke-dasharray: 6 4; }
+.dc .w-s9 { stroke-width: 1.75; stroke-dasharray: 1 4; }
+.dc .end { font-size: 11px; font-weight: 600; fill: var(--ink-2); }
+.mk-up { fill: var(--up); stroke: var(--surface); stroke-width: 2; }
+.mk-down { fill: var(--down); stroke: var(--surface); stroke-width: 2; }
+.dc .mk-halo { fill: none; stroke-width: 1.5; opacity: .45; }
+.dc .mk-halo.up { stroke: var(--up); } .dc .mk-halo.down { stroke: var(--down); }
+.dc .mk-label { font-size: 10px; font-weight: 700; }
+.dc .mk-label.up { fill: var(--up); } .dc .mk-label.down { fill: var(--down); }
+.dlg-tip .t-cross { margin-top: 6px; font-weight: 600; }
+.dlg-tip .t-cross.up { color: var(--up); } .dlg-tip .t-cross.down { color: var(--down); }
+.dc .cross { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.dc .hl { fill: var(--ink); opacity: .05; }
+.dlg-tip {
+  position: absolute; top: 12px; pointer-events: none; background: var(--surface); border: 1px solid var(--ring);
+  border-radius: 10px; padding: 8px 12px; box-shadow: 0 6px 20px rgba(0,0,0,.18); font-size: 12px; min-width: 190px;
+}
+.dlg-tip .t-date { color: var(--muted); margin-bottom: 4px; }
+.dlg-tip table { border-collapse: collapse; min-width: 0; width: 100%; }
+.dlg-tip td { padding: 1px 0; border: 0; white-space: nowrap; background: none !important; }
+.dlg-tip td:first-child { font-weight: 700; font-variant-numeric: tabular-nums; padding-right: 12px; }
+.dlg-tip td:last-child { color: var(--ink-2); }
+.dlg-tip .r { color: var(--up); }
+@media (max-width: 700px) { .dlg-chart { height: 320px; } .dlg-actions { margin-left: 0; } }
+
+@media (max-width: 900px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .main { grid-template-columns: minmax(0, 1fr); }
+  .tabs { flex-direction: row; overflow-x: auto; position: static; }
+  .tab { flex: 1 0 auto; }
+  .tab[aria-selected="true"] { box-shadow: inset 0 -3px 0 var(--accent); }
+  .lookup { margin-left: 0; order: 3; width: 100%; }
+  .lookup input { width: 100%; }
+  .legend { margin-left: 0; }
+}
 </style>
 </head>
 <body>
-<div class="page">
-  <h1>Supertrend over VWAP</h1>
-  <p class="sub">S&amp;P 500 &middot; daily Heikin Ashi candles &middot; Supertrend ({period}, {multiplier}) &middot; yearly VWAP of (H+L+C)/3 with &plusmn;{band}&sigma; band &middot; data as of {as_of}</p>
+<div class="wrap">
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17l5-5 4 4 8-9"/><path d="M15 7h5v5"/></svg>
+      Supertrend Monitor
+    </div>
+    <div class="asof">%%AS_OF%%</div>
+    <form class="lookup" id="lookup" role="search" autocomplete="off">
+      <input id="lookup-input" list="symbols" placeholder="Chart any symbol or company" aria-label="Chart any symbol or company" spellcheck="false">
+      <kbd>/</kbd>
+      <span class="lookup-msg" id="lookup-msg" role="status" hidden></span>
+    </form>
+    <datalist id="symbols">%%SYMBOL_OPTIONS%%</datalist>
+    %%UPDATED%%
+  </header>
 
-  <div class="layout">
-    <nav class="tabs" role="tablist" aria-orientation="vertical" aria-label="Views">
-      <button class="tab" role="tab" id="tab-flipped" aria-controls="flipped" aria-selected="true">Flipped since listed <span class="badge">{flipped_count}</span></button>
-      <button class="tab" role="tab" id="tab-rising" aria-controls="rising" aria-selected="false" tabindex="-1">Over VWAP band &ndash; Increasing <span class="badge">{rising_count}</span></button>
-      <button class="tab" role="tab" id="tab-signals" aria-controls="signals" aria-selected="false" tabindex="-1">Over VWAP band <span class="badge">{count}</span></button>
+  <section class="kpis" aria-label="Summary">
+    <button class="kpi" data-tab="flipped">
+      <div class="kpi-label">Flipped since listed</div>
+      <div class="kpi-value">%%FLIPPED%%</div>
+      <div class="kpi-foot">of %%WATCHED%% symbols ever listed</div>
+    </button>
+    <button class="kpi" data-tab="rising">
+      <div class="kpi-label">Over band &amp; increasing</div>
+      <div class="kpi-value">%%RISING%%</div>
+      <div class="kpi-foot">ST, SMA 3 and SMA 9 rising</div>
+    </button>
+    <button class="kpi" data-tab="signals">
+      <div class="kpi-label">Over VWAP band</div>
+      <div class="kpi-value">%%COUNT%%</div>
+      <div class="kpi-foot">%%DELTA%%</div>
+    </button>
+    <button class="kpi" data-tab="mtf">
+      <div class="kpi-label">D &middot; W &middot; M increasing</div>
+      <div class="kpi-value">%%MTF_ALL%%</div>
+      <div class="kpi-foot">Supertrend rising on all three</div>
+    </button>
+  </section>
+
+  <div class="main">
+    <nav class="tabs" role="tablist" aria-orientation="vertical" aria-label="Lists">
+      <button class="tab" role="tab" id="tab-flipped" aria-controls="panel-flipped" aria-selected="true">Flipped since listed <span class="count">%%FLIPPED%%</span></button>
+      <button class="tab" role="tab" id="tab-rising" aria-controls="panel-rising" aria-selected="false" tabindex="-1">Over band &ndash; Increasing <span class="count">%%RISING%%</span></button>
+      <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Over VWAP band <span class="count">%%COUNT%%</span></button>
+      <button class="tab" role="tab" id="tab-mtf" aria-controls="panel-mtf" aria-selected="false" tabindex="-1">D &middot; W &middot; M increasing <span class="count" id="mtf-count">%%MTF_ALL%%</span></button>
     </nav>
 
     <div>
-      <section class="panel" role="tabpanel" id="flipped" aria-labelledby="tab-flipped">
-        <p class="desc">Symbols from the saved daily lists (signals.json) whose Supertrend turned bearish after they were first listed, has since flipped back to bullish, and rose on today's candle. They don't need to be above the VWAP band today.</p>
-        <div class="stats">
-          <div class="stat"><b>{flipped_count}</b><span>flipped since listed, Supertrend rising</span></div>
-          <div class="stat"><b>{watched}</b><span>symbols ever listed in signals.json</span></div>
-        </div>
-        <div class="tools">
-          <input type="search" class="q" placeholder="Filter symbol or company" aria-label="Filter symbol or company">
-          <span class="legend"><span><i style="color:var(--st);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP upper band</span></span>
-        </div>
-        <div class="table-wrap">
-          <table data-sort="5">
-            <thead><tr>
-              <th data-type="text">Symbol</th>
-              <th data-type="text">Company</th>
-              <th class="num" data-type="num">Close</th>
-              <th class="num" data-type="num">Day</th>
-              <th class="num" data-type="num">ST change</th>
-              <th class="num" data-type="num">Bars</th>
-              <th data-type="text">First listed</th>
-              <th class="num" data-type="num">Days listed</th>
-              <th data-type="num">In today's list</th>
-              <th>Last 40 HA candles</th>
-            </tr></thead>
-            <tbody>
-{flipped_rows}
-            </tbody>
-          </table>
-          <div class="empty" hidden>No listed symbol has flipped bullish again with a rising Supertrend.</div>
-        </div>
-        <footer>"ST change" is the rise in the Supertrend line since the previous candle. "Bars" counts candles since the current bull run began, after the symbol was first listed. "Days listed" counts the days the symbol appeared in signals.json.</footer>
-      </section>
-
-      <section class="panel" role="tabpanel" id="rising" aria-labelledby="tab-rising" hidden>
-        <p class="desc">Stocks from the Over VWAP band list whose Supertrend, SMA 3 and SMA 9 all rose on today's candle. The SMAs use Heikin Ashi closes.</p>
-        <div class="stats">
-          <div class="stat"><b>{rising_count}</b><span>over VWAP band and increasing</span></div>
-          <div class="stat"><b>{count}</b><span>over VWAP band</span></div>
-        </div>
-        <div class="tools">
-          <input type="search" class="q" placeholder="Filter symbol or company" aria-label="Filter symbol or company">
-          <span class="legend"><span><i style="color:var(--st);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP upper band</span></span>
-        </div>
-        <div class="table-wrap">
-          <table data-sort="7">
-            <thead><tr>
-              <th data-type="text">Symbol</th>
-              <th data-type="text">Company</th>
-              <th class="num" data-type="num">Close</th>
-              <th class="num" data-type="num">Day</th>
-              <th class="num" data-type="num">ST change</th>
-              <th class="num" data-type="num">SMA 3 change</th>
-              <th class="num" data-type="num">SMA 9 change</th>
-              <th class="num" data-type="num">Bars</th>
-              <th>Last 40 HA candles</th>
-            </tr></thead>
-            <tbody>
-{rising_rows}
-            </tbody>
-          </table>
-          <div class="empty" hidden>No over-band stock has a rising Supertrend, SMA 3 and SMA 9 today.</div>
-        </div>
-        <footer>Changes are today's candle versus the previous one. "Bars" is the number of candles since the Supertrend turned bullish.</footer>
-      </section>
-
-      <section class="panel" role="tabpanel" id="signals" aria-labelledby="tab-signals" hidden>
-        <p class="desc">Stocks whose Supertrend is bullish and above the VWAP upper band today.</p>
-        <div class="stats">
-          <div class="stat"><b>{count}</b><span>Supertrend above VWAP upper band</span></div>
-          <div class="stat"><b>{bullish}</b><span>bullish Supertrend</span></div>
-          <div class="stat"><b>{total}</b><span>stocks tracked</span></div>
-          <div class="stat"><b>{fresh}</b><span>listed stocks that turned bullish in last 3 bars</span></div>
-        </div>
-        <div class="tools">
-          <input type="search" class="q" placeholder="Filter symbol or company" aria-label="Filter symbol or company">
-          <label><input type="checkbox" class="fresh-only"> New signals only</label>
-          <span class="legend"><span><i style="color:var(--st);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP upper band</span></span>
+      <section class="card panel" role="tabpanel" id="panel-flipped" aria-labelledby="tab-flipped">
+        <div class="panel-head">
+          <h2>Flipped since listed</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
         </div>
         <div class="table-wrap">
           <table data-sort="4">
             <thead><tr>
-              <th data-type="text">Symbol</th>
-              <th data-type="text">Company</th>
+              <th data-type="text">Stock</th>
               <th class="num" data-type="num">Close</th>
               <th class="num" data-type="num">Day</th>
-              <th class="num" data-type="num">Bars</th>
-              <th>Last 40 HA candles</th>
+              <th class="num" data-type="num" title="Supertrend change vs previous candle">ST &Delta;</th>
+              <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
+              <th data-type="text">First listed</th>
+              <th class="num" data-type="num" title="Days in signals.json">Days listed</th>
+              <th data-type="num">Today</th>
+              <th>Last 40 candles</th>
             </tr></thead>
             <tbody>
-{signal_rows}
+%%FLIPPED_ROWS%%
             </tbody>
           </table>
-          <div class="empty" hidden>No matching stocks.</div>
+          <div class="empty" hidden>No stocks</div>
         </div>
-        <footer>"Bars" is the number of candles since the Supertrend turned bullish. The VWAP restarts on the first trading day of each year. Not investment advice.</footer>
+      </section>
+
+      <section class="card panel" role="tabpanel" id="panel-rising" aria-labelledby="tab-rising" hidden>
+        <div class="panel-head">
+          <h2>Over band &ndash; Increasing</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
+        </div>
+        <div class="table-wrap">
+          <table data-sort="6">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Supertrend change vs previous candle">ST &Delta;</th>
+              <th class="num" data-type="num" title="SMA 3 change vs previous candle">SMA 3 &Delta;</th>
+              <th class="num" data-type="num" title="SMA 9 change vs previous candle">SMA 9 &Delta;</th>
+              <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
+              <th>Last 40 candles</th>
+            </tr></thead>
+            <tbody>
+%%RISING_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
+      </section>
+
+      <section class="card panel" role="tabpanel" id="panel-signals" aria-labelledby="tab-signals" hidden>
+        <div class="panel-head">
+          <h2>Over VWAP band</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <label class="toggle"><input type="checkbox" class="fresh-only"> New (%%FRESH%%)</label>
+          <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
+        </div>
+        <div class="table-wrap">
+          <table data-sort="3">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Candles since the Supertrend turned bullish">Trend age</th>
+              <th>Last 40 candles</th>
+            </tr></thead>
+            <tbody>
+%%SIGNAL_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
+      </section>
+
+      <section class="card panel" role="tabpanel" id="panel-mtf" aria-labelledby="tab-mtf" hidden>
+        <div class="panel-head">
+          <h2>D &middot; W &middot; M increasing</h2>
+          <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
+          <fieldset class="tf-filter">
+            <legend>Rising on</legend>
+            <label><input type="checkbox" class="tf-check" value="d" checked> Daily</label>
+            <label><input type="checkbox" class="tf-check" value="w" checked> Weekly</label>
+            <label><input type="checkbox" class="tf-check" value="m" checked> Monthly</label>
+          </fieldset>
+          <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
+        </div>
+        <div class="table-wrap">
+          <table data-sort="0">
+            <thead><tr>
+              <th data-type="text">Stock</th>
+              <th class="num" data-type="num">Close</th>
+              <th class="num" data-type="num">Day</th>
+              <th class="num" data-type="num" title="Daily Heikin Ashi Supertrend vs previous day">Daily ST</th>
+              <th class="num" data-type="num" title="Weekly Heikin Ashi Supertrend vs previous week (current week in progress)">Weekly ST</th>
+              <th class="num" data-type="num" title="Monthly Heikin Ashi Supertrend vs previous month (current month in progress)">Monthly ST</th>
+              <th>Last 40 daily candles</th>
+            </tr></thead>
+            <tbody>
+%%MTF_ROWS%%
+            </tbody>
+          </table>
+          <div class="empty" hidden>No stocks</div>
+        </div>
       </section>
     </div>
   </div>
 </div>
+
+
+<dialog class="detail" id="detail" aria-labelledby="detail-symbol">
+  <div class="dlg-head">
+    <div class="dlg-title"><h3 id="detail-symbol"></h3><span id="detail-name"></span></div>
+    <div class="dlg-price"><span id="detail-close"></span><span class="pill" id="detail-chg"></span></div>
+    <div class="dlg-actions">
+      <a class="dlg-link" id="detail-link" target="_blank" rel="noopener">Yahoo Finance &#8599;</a>
+      <button class="dlg-close" id="detail-close-btn" aria-label="Close" autofocus>&times;</button>
+    </div>
+  </div>
+  <div class="dlg-legend" aria-label="Legend">
+    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="2.75" stroke-linecap="round"/></svg>Supertrend</span>
+    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.75" stroke-dasharray="6 4" stroke-linecap="round"/></svg>SMA 3</span>
+    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="currentColor" stroke-width="1.75" stroke-dasharray="1 4" stroke-linecap="round"/></svg>SMA 9</span>
+    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--band)" stroke-width="1.5"/></svg>VWAP band</span>
+    <i class="sep"></i>
+    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--up)" stroke-width="2.75" stroke-linecap="round"/></svg>Rising</span>
+    <span><svg viewBox="0 0 26 8"><line x1="1" y1="4" x2="25" y2="4" stroke="var(--muted)" stroke-width="2.75" stroke-linecap="round"/></svg>Not rising</span>
+    <i class="sep"></i>
+    <span><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-up"/></svg>Cross above</span>
+    <span><svg viewBox="0 0 10 8" style="width:10px"><circle cx="5" cy="4" r="4.5" class="mk-down"/></svg>Cross below</span>
+    <div class="zoom" role="group" aria-label="Range">
+      <button type="button" data-span="40">40D</button><button type="button" data-span="90">90D</button><button type="button" data-span="180">180D</button>
+    </div>
+  </div>
+  <div class="dlg-chart" id="detail-chart"></div>
+</dialog>
+<script type="application/json" id="details-data">%%DETAILS%%</script>
 <script>
-(() => {{
-  // Tabs (vertical on wide screens). The selected tab is kept in the URL hash.
+(() => {
+  /* ---------- Tabs ---------- */
   const tabs = [...document.querySelectorAll(".tab")];
-  function select(tab, focus) {{
-    for (const t of tabs) {{
-      const on = t === tab;
+  const kpis = [...document.querySelectorAll("button.kpi")];
+  function select(id, focus) {
+    for (const t of tabs) {
+      const on = t.getAttribute("aria-controls") === "panel-" + id;
       t.setAttribute("aria-selected", on);
       t.tabIndex = on ? 0 : -1;
       document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
-    }}
-    if (focus) tab.focus();
-    history.replaceState(null, "", "#" + tab.getAttribute("aria-controls"));
-  }}
-  tabs.forEach((tab, i) => {{
-    tab.addEventListener("click", () => select(tab));
-    tab.addEventListener("keydown", e => {{
-      const step = {{ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1}}[e.key];
-      if (step) {{ e.preventDefault(); select(tabs[(i + step + tabs.length) % tabs.length], true); }}
-    }});
-  }});
-  const initial = tabs.find(t => "#" + t.getAttribute("aria-controls") === location.hash);
-  if (initial) select(initial);
+      if (on && focus) t.focus();
+    }
+    for (const k of kpis) k.setAttribute("aria-pressed", k.dataset.tab === id);
+    history.replaceState(null, "", "#" + id);
+  }
+  tabs.forEach((tab, i) => {
+    tab.addEventListener("click", () => select(tab.id.slice(4)));
+    tab.addEventListener("keydown", e => {
+      const step = {ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1}[e.key];
+      if (!step) return;
+      e.preventDefault();
+      select(tabs[(i + step + tabs.length) % tabs.length].id.slice(4), true);
+    });
+  });
+  kpis.forEach(k => k.addEventListener("click", () => {
+    select(k.dataset.tab);
+    document.querySelector(".main").scrollIntoView({behavior: "smooth", block: "start"});
+  }));
+  const fromHash = tabs.find(t => "#" + t.id.slice(4) === location.hash);
+  select(fromHash ? fromHash.id.slice(4) : "flipped");
 
-  // Sorting and filtering, per panel.
-  for (const panel of document.querySelectorAll(".panel")) {{
+  /* ---------- Tables: sort + search ---------- */
+  for (const panel of document.querySelectorAll(".panel")) {
     const table = panel.querySelector("table");
     const body = table.tBodies[0];
     const headers = [...table.tHead.rows[0].cells];
-    const q = panel.querySelector(".q");
+    const search = panel.querySelector(".search");
     const freshOnly = panel.querySelector(".fresh-only");
+    const tfChecks = [...panel.querySelectorAll(".tf-check")];
     const empty = panel.querySelector(".empty");
 
-    function sortBy(index, dir) {{
-      const type = headers[index].dataset.type;
-      const rows = [...body.rows];
-      rows.sort((a, b) => {{
+    function sortBy(index, dir) {
+      const numeric = headers[index].dataset.type === "num";
+      const rows = [...body.rows].sort((a, b) => {
         const x = a.cells[index].dataset.v, y = b.cells[index].dataset.v;
-        const cmp = type === "num" ? x - y : x.localeCompare(y);
+        const cmp = numeric ? x - y : x.localeCompare(y);
         return dir === "ascending" ? cmp : -cmp;
-      }});
+      });
       headers.forEach(h => h.removeAttribute("aria-sort"));
       headers[index].setAttribute("aria-sort", dir);
       body.append(...rows);
-    }}
-    headers.forEach((h, i) => {{
+    }
+    headers.forEach((h, i) => {
       if (!h.dataset.type) return;
-      h.addEventListener("click", () => {{
-        sortBy(i, h.getAttribute("aria-sort") === "ascending" ? "descending" : "ascending");
-      }});
-    }});
-
-    function filter() {{
-      const term = q.value.trim().toUpperCase();
+      h.addEventListener("click", () =>
+        sortBy(i, h.getAttribute("aria-sort") === "ascending" ? "descending" : "ascending"));
+    });
+    function filter() {
+      const term = search.value.trim().toUpperCase();
       let shown = 0;
-      for (const row of body.rows) {{
-        const text = (row.cells[0].dataset.v + " " + row.cells[1].dataset.v).toUpperCase();
-        const match = text.includes(term) &&
-          (!freshOnly || !freshOnly.checked || row.classList.contains("fresh"));
+      for (const row of body.rows) {
+        const match = row.dataset.search.includes(term) &&
+          (!freshOnly || !freshOnly.checked || row.classList.contains("fresh")) &&
+          tfChecks.every(c => !c.checked || row.dataset[c.value] === "1");
         row.hidden = !match;
         shown += match;
-      }}
+      }
       empty.hidden = shown > 0;
-    }}
-    q.addEventListener("input", filter);
+      if (tfChecks.length) document.getElementById("mtf-count").textContent = shown;
+    }
+    search.addEventListener("input", filter);
     if (freshOnly) freshOnly.addEventListener("change", filter);
-
+    tfChecks.forEach(c => c.addEventListener("change", filter));
     sortBy(Number(table.dataset.sort), "ascending");
     filter();
-  }}
-}})();
+  }
+
+  /* ---------- Stock detail pop-up ---------- */
+  const RAW = JSON.parse(document.getElementById("details-data").textContent);
+  const DETAILS = {};
+  function getDetail(sym) {
+    if (DETAILS[sym]) return DETAILS[sym];
+    const r = RAW.stocks[sym];
+    if (!r) return null;
+    const f = a => a.map(v => v == null ? null : v / 100);
+    const len = r.c.length;
+    return DETAILS[sym] = {
+      d: r.d || RAW.dates.slice(RAW.dates.length - len),
+      o: f(r.o), h: f(r.h), l: f(r.l), c: f(r.c), st: f(r.st), s3: f(r.s3), s9: f(r.s9), vw: f(r.vw), up: f(r.up),
+      dir: [...r.dir].map(ch => ch === "+" ? 1 : -1),
+      close: r.close / 100, chg: r.chg / 100, name: r.n,
+    };
+  }
+  const dlg = document.getElementById("detail");
+  const chartHost = document.getElementById("detail-chart");
+  const NS = "http://www.w3.org/2000/svg";
+  let openSym = null;
+  let span = 40;  // visible candles; the window always ends at the latest candle
+  const MIN_SPAN = 20;
+  const zoomButtons = [...document.querySelectorAll(".zoom button")];
+
+  function el(name, attrs, parent) {
+    const node = document.createElementNS(NS, name);
+    for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+    if (parent) parent.appendChild(node);
+    return node;
+  }
+  const money = v => v == null ? "—" : v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  const shortDate = d => new Date(d + "T12:00:00").toLocaleDateString(undefined, {month: "short", day: "numeric"});
+  const longDate = d => new Date(d + "T12:00:00").toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric", year: "numeric"});
+  function niceStep(span, target) {
+    const raw = span / target, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    for (const m of [1, 2, 2.5, 5, 10]) if (m * mag >= raw) return m * mag;
+    return 10 * mag;
+  }
+
+  function openDetail(sym) {
+    const b = getDetail(sym);
+    if (!b) return false;
+    openSym = sym;
+    document.getElementById("detail-symbol").textContent = sym;
+    document.getElementById("detail-name").textContent = b.name;
+    document.getElementById("detail-close").textContent = money(b.close);
+    const chg = document.getElementById("detail-chg");
+    chg.textContent = (b.chg >= 0 ? "+" : "") + b.chg.toFixed(2) + "%";
+    chg.className = "pill " + (b.chg >= 0 ? "up" : "down");
+    document.getElementById("detail-link").href = "https://finance.yahoo.com/quote/" + encodeURIComponent(sym);
+    span = Math.min(40, b.d.length);
+    dlg.showModal();
+    drawDetail();
+    return true;
+  }
+
+  function drawDetail() {
+    const b = getDetail(openSym);
+    chartHost.textContent = "";
+    const n = b.d.length;
+    span = Math.max(Math.min(span, n), Math.min(MIN_SPAN, n));
+    const start = n - span;
+    zoomButtons.forEach(z => z.setAttribute("aria-pressed", Number(z.dataset.span) === span));
+    const W = chartHost.clientWidth - 16, H = chartHost.clientHeight - 16;
+    const pad = {l: 56, r: 92, t: 12, b: 26};
+    const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b, step = iw / span;
+    const all = [b.h, b.l, b.st, b.s3, b.s9, b.up, b.vw].flatMap(a => a.slice(start)).filter(v => v != null);
+    let lo = Math.min(...all), hi = Math.max(...all);
+    const margin = (hi - lo) * 0.04 || 1; lo -= margin; hi += margin;
+    const x = i => pad.l + (i - start + 0.5) * step;
+    const y = v => pad.t + ((hi - v) / (hi - lo)) * ih;
+    const svg = el("svg", {class: "dc", viewBox: `0 0 ${W} ${H}`, tabindex: 0, role: "img",
+      "aria-label": `${openSym}: last ${span} daily Heikin Ashi candles with Supertrend, SMA 3, SMA 9 and VWAP band`}, chartHost);
+
+    // Grid + y ticks (left), date ticks (bottom)
+    const ys = niceStep(hi - lo, 5);
+    for (let v = Math.ceil(lo / ys) * ys; v <= hi; v += ys) {
+      el("line", {x1: pad.l, x2: W - pad.r, y1: y(v), y2: y(v), class: "grid"}, svg);
+      el("text", {x: pad.l - 8, y: y(v) + 4, "text-anchor": "end", class: "tick"}, svg).textContent = money(v);
+    }
+    for (let i = start; i < n; i += Math.ceil(span / 6)) {
+      el("text", {x: x(i), y: H - 6, "text-anchor": "middle", class: "tick"}, svg).textContent = shortDate(b.d[i]);
+    }
+    const hl = el("rect", {y: pad.t, height: ih, width: step, class: "hl", visibility: "hidden"}, svg);
+
+    // VWAP band (restarts each January, so break at a year change)
+    const sameYear = i => b.d[i].slice(0, 4) === b.d[i - 1].slice(0, 4);
+    let runs = [], cur = [];
+    for (let i = start; i < n; i++) {
+      if (b.up[i] == null || b.vw[i] == null || (i > start && !sameYear(i))) { if (cur.length) runs.push(cur); cur = []; }
+      if (b.up[i] != null && b.vw[i] != null) cur.push(i);
+    }
+    if (cur.length) runs.push(cur);
+    for (const r of runs) {
+      const top = r.map(i => `${x(i)},${y(b.up[i])}`), bot = r.slice().reverse().map(i => `${x(i)},${y(b.vw[i])}`);
+      el("polygon", {points: top.concat(bot).join(" "), class: "band-fill"}, svg);
+      el("polyline", {points: top.join(" "), class: "band"}, svg);
+      el("polyline", {points: r.map(i => `${x(i)},${y(b.vw[i])}`).join(" "), class: "vwap"}, svg);
+    }
+
+    // Heikin Ashi candles
+    const cg = el("g", {class: "candles"}, svg);
+    const bw = Math.max(step * 0.6, 1.5);
+    for (let i = start; i < n; i++) {
+      const cls = b.c[i] >= b.o[i] ? "c-up" : "c-down";
+      const top = y(Math.max(b.o[i], b.c[i])), bottom = y(Math.min(b.o[i], b.c[i]));
+      el("line", {x1: x(i), x2: x(i), y1: y(b.h[i]), y2: y(b.l[i]), class: cls, "stroke-width": 1}, cg);
+      el("rect", {x: x(i) - bw / 2, y: top, width: bw, height: Math.max(bottom - top, 1), rx: 1, class: cls}, cg);
+    }
+
+    // Lines: each segment green when the value rose from the previous candle, gray otherwise.
+    function segments(values, width, breakAt) {
+      const paths = {rise: "", flat: ""};
+      for (let i = start + 1; i < n; i++) {
+        if (values[i] == null || values[i - 1] == null || (breakAt && breakAt(i))) continue;
+        const kind = values[i] > values[i - 1] ? "rise" : "flat";
+        paths[kind] += `M${x(i - 1)},${y(values[i - 1])}L${x(i)},${y(values[i])}`;
+      }
+      for (const [kind, d] of Object.entries(paths)) if (d) el("path", {d, class: `seg ${kind} ${width}`}, svg);
+    }
+    segments(b.s9, "w-s9");
+    segments(b.s3, "w-s3");
+    segments(b.st, "w-st", i => b.dir[i] !== b.dir[i - 1]);
+
+    // Supertrend crossing the VWAP upper band. Ignore Supertrend flips (the line jumps
+    // between bands) and the January VWAP reset, which aren't real crossings.
+    const crossings = {};
+    for (let i = start + 1; i < n; i++) {
+      const s0 = b.st[i - 1], s1 = b.st[i], u0 = b.up[i - 1], u1 = b.up[i];
+      if ([s0, s1, u0, u1].some(v => v == null) || b.dir[i] !== b.dir[i - 1] || !sameYear(i)) continue;
+      const d0 = s0 - u0, d1 = s1 - u1;
+      if ((d0 <= 0 && d1 > 0) || (d0 >= 0 && d1 < 0)) {
+        const kind = d1 > 0 ? "up" : "down";
+        const t = d0 === d1 ? 1 : d0 / (d0 - d1);  // where the two lines meet between the candles
+        const cx = x(i - 1) + t * step, cy = y(s0 + t * (s1 - s0));
+        crossings[i] = kind;
+        el("circle", {cx, cy, r: 10, class: `mk-halo ${kind}`}, svg);
+        el("circle", {cx, cy, r: 5.5, class: `mk-${kind}`}, svg);
+        el("text", {x: cx, y: kind === "up" ? cy - 14 : cy + 22, "text-anchor": "middle", class: `mk-label ${kind}`},
+          svg).textContent = kind === "up" ? "\u25B2" : "\u25BC";
+      }
+    }
+
+    // Right-edge labels, nudged apart so they never overlap
+    const last = n - 1;
+    const labels = [["Supertrend", b.st[last]], ["SMA 3", b.s3[last]], ["SMA 9", b.s9[last]], ["VWAP band", b.up[last]]]
+      .filter(([, v]) => v != null).map(([t, v]) => ({t, y: y(v)})).sort((a, c) => a.y - c.y);
+    for (let k = 1; k < labels.length; k++) labels[k].y = Math.max(labels[k].y, labels[k - 1].y + 13);
+    for (const lab of labels) el("text", {x: W - pad.r + 8, y: lab.y + 4, class: "end"}, svg).textContent = lab.t;
+
+    // Crosshair + readout
+    const cross = el("line", {y1: pad.t, y2: pad.t + ih, class: "cross", visibility: "hidden"}, svg);
+    const tip = document.createElement("div");
+    tip.className = "dlg-tip"; tip.hidden = true;
+    chartHost.appendChild(tip);
+    let idx = last;
+    function rows(i) {
+      const up = (arr, extra) => i > 0 && arr[i] != null && arr[i - 1] != null && arr[i] > arr[i - 1] && (!extra || extra());
+      return [
+        [money(b.c[i]), "HA close"],
+        [`${money(b.o[i])} / ${money(b.h[i])} / ${money(b.l[i])}`, "open / high / low"],
+        [money(b.st[i]), "Supertrend", up(b.st, () => b.dir[i] === b.dir[i - 1])],
+        [money(b.s3[i]), "SMA 3", up(b.s3)],
+        [money(b.s9[i]), "SMA 9", up(b.s9)],
+        [money(b.up[i]), "VWAP band"],
+        [money(b.vw[i]), "VWAP"],
+      ];
+    }
+    function show(i) {
+      idx = Math.max(start, Math.min(last, i));
+      cross.setAttribute("x1", x(idx)); cross.setAttribute("x2", x(idx)); cross.setAttribute("visibility", "visible");
+      hl.setAttribute("x", x(idx) - step / 2); hl.setAttribute("visibility", "visible");
+      tip.textContent = "";
+      const date = document.createElement("div"); date.className = "t-date"; date.textContent = longDate(b.d[idx]);
+      const table = document.createElement("table");
+      for (const [value, label, rising] of rows(idx)) {
+        const tr = table.insertRow();
+        const a = tr.insertCell(), c = tr.insertCell();
+        a.textContent = value + (rising ? " ▲" : "");
+        if (rising) a.className = "r";
+        c.textContent = label;
+      }
+      tip.append(date, table);
+      if (crossings[idx]) {
+        const note = document.createElement("div");
+        note.className = "t-cross " + crossings[idx];
+        note.textContent = crossings[idx] === "up" ? "\u25B2 Supertrend crossed above VWAP band" : "\u25BC Supertrend crossed below VWAP band";
+        tip.append(note);
+      }
+      tip.hidden = false;
+      // Keep the readout on the side away from the pointer.
+      const onLeft = x(idx) > W / 2;
+      tip.style.left = onLeft ? (pad.l + 16) + "px" : "auto";
+      tip.style.right = onLeft ? "auto" : (pad.r + 24) + "px";
+    }
+    function hide() { cross.setAttribute("visibility", "hidden"); hl.setAttribute("visibility", "hidden"); tip.hidden = true; }
+    svg.addEventListener("pointermove", e => {
+      const r = svg.getBoundingClientRect();
+      show(start + Math.floor(((e.clientX - r.left) * (W / r.width) - pad.l) / step));
+    });
+    svg.addEventListener("pointerleave", hide);
+    svg.addEventListener("focus", () => show(idx));
+    svg.addEventListener("blur", hide);
+    svg.addEventListener("keydown", e => {
+      const d = {ArrowLeft: -1, ArrowRight: 1, Home: -1e9, End: 1e9}[e.key];
+      if (d) { e.preventDefault(); show(idx + d); }
+    });
+  }
+
+  document.addEventListener("click", e => {
+    const target = e.target.closest(".stock a, .spark-cell");
+    if (!target || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+    const sym = target.closest("tr").cells[0].dataset.v;
+    if (openDetail(sym)) e.preventDefault();
+  });
+  function zoomTo(next) {
+    if (!openSym) return;
+    const n = getDetail(openSym).d.length;
+    next = Math.max(Math.min(MIN_SPAN, n), Math.min(n, Math.round(next)));
+    if (next !== span) { span = next; drawDetail(); }
+  }
+  zoomButtons.forEach(z => z.addEventListener("click", () => zoomTo(Number(z.dataset.span))));
+  // Mouse wheel / trackpad pinch: scroll down or pinch in to zoom out, up or pinch out to zoom in.
+  chartHost.addEventListener("wheel", e => {
+    e.preventDefault();
+    zoomTo(span * Math.pow(1.0015, e.deltaY * (e.ctrlKey ? 4 : 1)));
+  }, {passive: false});
+  document.getElementById("detail-close-btn").addEventListener("click", () => dlg.close());
+
+  // Symbol lookup: exact symbol (BRK.B or BRK-B), exact company name, or the first name match.
+  const lookup = document.getElementById("lookup");
+  const lookupInput = document.getElementById("lookup-input");
+  const lookupMsg = document.getElementById("lookup-msg");
+  const NAMES = Object.entries(RAW.stocks).map(([sym, r]) => [sym, r.n.toUpperCase()]);
+  function resolve(text) {
+    const q = text.trim().toUpperCase();
+    if (!q) return null;
+    const sym = q.replace(/\\./g, "-");
+    if (RAW.stocks[sym]) return sym;
+    const hit = NAMES.find(([, n]) => n === q) || NAMES.find(([, n]) => n.startsWith(q)) || NAMES.find(([, n]) => n.includes(q));
+    return hit ? hit[0] : null;
+  }
+  function chartFromLookup() {
+    const sym = resolve(lookupInput.value);
+    if (sym && openDetail(sym)) {
+      lookupMsg.hidden = true;
+      lookupInput.value = "";
+      lookupInput.blur();
+    } else if (lookupInput.value.trim()) {
+      lookupMsg.textContent = `No S&P 500 match for \u201c${lookupInput.value.trim()}\u201d`;
+      lookupMsg.hidden = false;
+    }
+  }
+  lookup.addEventListener("submit", e => { e.preventDefault(); chartFromLookup(); });
+  lookupInput.addEventListener("input", e => {
+    lookupMsg.hidden = true;
+    // Picking a suggestion from the list opens the chart right away.
+    if ((!e.inputType || e.inputType === "insertReplacementText") && RAW.stocks[lookupInput.value]) chartFromLookup();
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "/" && !dlg.open && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) {
+      e.preventDefault();
+      lookupInput.focus();
+    }
+  });
+  dlg.addEventListener("click", e => { if (e.target === dlg) dlg.close(); });  // click on the backdrop
+  dlg.addEventListener("close", () => { openSym = null; });
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { if (openSym) drawDetail(); }, 100);
+  });
+})();
 </script>
 </body>
 </html>
@@ -666,21 +1369,36 @@ def signal_records(signals: list[Signal]) -> list[dict]:
     ]
 
 
-def save_signals(signals: list[Signal], path: Path, as_of: str) -> dict[str, list[dict]]:
+def save_signals(
+    signals: list[Signal], path: Path, as_of: str, keep_days: int = 0
+) -> dict[str, list[dict]]:
     """Add the day's filtered list to a JSON file of {date: [stocks...]}.
 
     Earlier days are kept; running again on the same day replaces that day's
     entry (e.g. the 5 PM run replaces the intraday 12 PM list).
     """
-    return write_history(path, {as_of: signal_records(signals)})
+    return write_history(path, {as_of: signal_records(signals)}, keep_days)
 
 
-def write_history(path: Path, days: dict[str, list[dict]]) -> dict[str, list[dict]]:
-    """Merge {date: records} into the JSON file, replacing those dates."""
+def write_history(
+    path: Path, days: dict[str, list[dict]], keep_days: int = 0
+) -> dict[str, list[dict]]:
+    """Merge {date: records} into the JSON file, replacing those dates.
+
+    With keep_days > 0, dates more than keep_days calendar days before the newest
+    date in the file are removed.
+    """
     history: dict[str, list[dict]] = {}
     if path.exists():
         history = json.loads(path.read_text(encoding="utf-8"))
     history.update(days)
+    if keep_days > 0 and history:
+        cutoff = (pd.Timestamp(max(history)) - pd.Timedelta(days=keep_days)).strftime("%Y-%m-%d")
+        removed = [day for day in history if day < cutoff]
+        for day in removed:
+            del history[day]
+        if removed:
+            print(f"Removed {len(removed)} days older than {cutoff} from {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = dict(sorted(history.items()))
     path.write_text(json.dumps(ordered, indent=2) + "\n", encoding="utf-8")
@@ -721,8 +1439,49 @@ def backfill(files: list[Path], days: int, args: argparse.Namespace) -> None:
             continue
         filled[day] = signal_records(filtered(current))
         print(f"{day}: {len(filled[day])} stocks")
-    write_history(args.signals_file, filled)
+    write_history(args.signals_file, filled, args.keep_days)
     print(f"Backfilled {len(filled)} trading days ({trading_days[0]} to {trading_days[-1]}) -> {args.signals_file}")
+
+
+ALERT_LISTS = {"flipped": "Flipped since listed", "dwm": "D · W · M increasing"}
+
+
+def update_alerts(
+    lists: dict[str, list[str]], state_path: Path, alert_path: Path | None,
+    details: dict[str, dict], companies: dict[str, str], as_of: str,
+) -> dict[str, list[str]]:
+    """Save this run's lists and, if a previous run's lists exist, write a Markdown alert
+    for symbols that weren't in them. The alert's first line is the issue title.
+    Returns {list key: new symbols}."""
+    previous = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else None
+    state_path.write_text(json.dumps({"as_of": as_of, "lists": lists}, indent=2) + "\n", encoding="utf-8")
+    if previous is None:
+        return {}  # first run: just record the baseline
+    new = {key: [s for s in syms if s not in previous["lists"].get(key, [])] for key, syms in lists.items()}
+    if not alert_path or not any(new.values()):
+        return new
+
+    now = datetime.now(ZoneInfo("America/New_York"))
+    counts = ", ".join(f"{len(syms)} {ALERT_LISTS[key]}" for key, syms in new.items() if syms)
+    lines = [
+        f"New signals {as_of}: {counts}",
+        "",
+        f"Data as of **{as_of}** · run at {now.strftime('%-I:%M %p %Z')}. "
+        "Stocks below were not in these lists on the previous run.",
+    ]
+    for key, syms in new.items():
+        if not syms:
+            continue
+        lines += ["", f"### {ALERT_LISTS[key]} ({len(syms)} new)", "",
+                  "| Symbol | Company | Close | Day |", "|---|---|---:|---:|"]
+        for sym in syms:
+            det = details.get(sym, {})
+            name = companies.get(sym, "").replace("|", "\\|")
+            close = f"{det['close']:,.2f}" if det else ""
+            chg = f"{det['chg']:+.2f}%" if det else ""
+            lines.append(f"| [{sym}](https://finance.yahoo.com/quote/{sym}) | {name} | {close} | {chg} |")
+    alert_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return new
 
 
 def main() -> int:
@@ -739,12 +1498,25 @@ def main() -> int:
     )
     parser.add_argument("--vwap-band", type=float, default=1.0, help="VWAP upper band in standard deviations (default: 1)")
     parser.add_argument(
+        "--keep-days",
+        type=int,
+        default=90,
+        help="remove days older than this many calendar days from signals.json (default: 90; 0 keeps everything)",
+    )
+    parser.add_argument(
+        "--alert-file",
+        type=Path,
+        help="write a Markdown alert here when stocks newly join Flipped since listed or D · W · M increasing",
+    )
+    parser.add_argument(
         "--backfill",
         type=int,
         metavar="DAYS",
         help="one-off: recompute signals.json for each trading day in the last DAYS calendar days",
     )
     args = parser.parse_args()
+    if args.keep_days < 0:
+        parser.error("--keep-days must be 0 or greater")
     if args.period < 1 or args.multiplier <= 0 or args.vwap_band < 0:
         parser.error("--period must be >= 1, --multiplier > 0 and --vwap-band >= 0")
 
@@ -757,7 +1529,7 @@ def main() -> int:
     results: list[Result] = []
     for path in files:
         try:
-            result = analyze(path, args.period, args.multiplier, args.vwap_band)
+            result = analyze(path, args.period, args.multiplier, args.vwap_band, multi=True)
         except Exception as exc:
             print(f"Skipped {path.name}: {exc}")
             continue
@@ -769,18 +1541,35 @@ def main() -> int:
     signals = filtered(current)
 
     # Save today's list first so the "flipped since listed" tab also covers today's symbols.
-    history = save_signals(signals, args.signals_file, as_of)
+    history = save_signals(signals, args.signals_file, as_of, args.keep_days)
     flipped = find_flipped(current, history, as_of)
     watched = len({stock["symbol"] for stocks in history.values() for stock in stocks})
 
     companies_path = args.data_dir / "companies.json"
     companies = json.loads(companies_path.read_text(encoding="utf-8")) if companies_path.exists() else {}
     rising = find_rising(signals)
+    # Stocks whose Supertrend is rising on at least one timeframe; the page filters further.
+    mtfs = sorted(
+        (r.mtf for r in current if r.mtf and any(v.rising for v in r.mtf.steps.values())),
+        key=lambda m: m.symbol,
+    )
+    # Chart data for every current stock, so the lookup box can chart any symbol.
+    details = {r.detail["sym"]: r.detail for r in current if r.detail}
     page = render(
-        signals, rising, flipped, companies, watched, len(current), bullish,
+        signals, rising, flipped, mtfs, details, companies, history, watched, len(current), bullish,
         as_of, args.period, args.multiplier, args.vwap_band,
     )
     args.output.write_text(page, encoding="utf-8")
+
+    lists = {
+        "flipped": sorted(f.signal.symbol for f in flipped),
+        "dwm": [m.symbol for m in mtfs if all(v.rising for v in m.steps.values())],
+    }
+    new = update_alerts(
+        lists, args.data_dir / "alerts_state.json", args.alert_file, details, companies, as_of
+    )
+    if any(new.values()):
+        print("New: " + "; ".join(f"{ALERT_LISTS[k]}: {', '.join(v)}" for k, v in new.items() if v))
     print(
         f"{len(signals)} of {len(current)} stocks have a bullish Supertrend above the "
         f"VWAP upper band ({bullish} bullish), {len(rising)} of them increasing; {len(flipped)} of {watched} listed symbols "
