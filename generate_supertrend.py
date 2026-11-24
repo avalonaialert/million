@@ -819,39 +819,39 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 
   <section class="kpis" aria-label="Summary">
     <button class="kpi" data-tab="flipped">
-      <div class="kpi-label">Flipped since listed</div>
+      <div class="kpi-label">Bullish Re-entry</div>
       <div class="kpi-value">%%FLIPPED%%</div>
       <div class="kpi-foot">of %%WATCHED%% symbols ever listed</div>
     </button>
     <button class="kpi" data-tab="rising">
-      <div class="kpi-label">Over band &amp; increasing</div>
+      <div class="kpi-label">Above VWAP &middot; Rising</div>
       <div class="kpi-value">%%RISING%%</div>
       <div class="kpi-foot">ST, SMA 3 and SMA 9 rising</div>
     </button>
     <button class="kpi" data-tab="signals">
-      <div class="kpi-label">Over VWAP band</div>
+      <div class="kpi-label">Above VWAP Band</div>
       <div class="kpi-value">%%COUNT%%</div>
       <div class="kpi-foot">%%DELTA%%</div>
     </button>
     <button class="kpi" data-tab="mtf">
-      <div class="kpi-label">D &middot; W &middot; M increasing</div>
+      <div class="kpi-label">Multi-Timeframe Rising</div>
       <div class="kpi-value">%%MTF_ALL%%</div>
-      <div class="kpi-foot">Supertrend rising on all three</div>
+      <div class="kpi-foot">Daily, weekly &amp; monthly Supertrend rising</div>
     </button>
   </section>
 
   <div class="main">
     <nav class="tabs" role="tablist" aria-orientation="vertical" aria-label="Lists">
-      <button class="tab" role="tab" id="tab-flipped" aria-controls="panel-flipped" aria-selected="true">Flipped since listed <span class="count">%%FLIPPED%%</span></button>
-      <button class="tab" role="tab" id="tab-rising" aria-controls="panel-rising" aria-selected="false" tabindex="-1">Over band &ndash; Increasing <span class="count">%%RISING%%</span></button>
-      <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Over VWAP band <span class="count">%%COUNT%%</span></button>
-      <button class="tab" role="tab" id="tab-mtf" aria-controls="panel-mtf" aria-selected="false" tabindex="-1">D &middot; W &middot; M increasing <span class="count" id="mtf-count">%%MTF_ALL%%</span></button>
+      <button class="tab" role="tab" id="tab-flipped" aria-controls="panel-flipped" aria-selected="true">Bullish Re-entry <span class="count">%%FLIPPED%%</span></button>
+      <button class="tab" role="tab" id="tab-rising" aria-controls="panel-rising" aria-selected="false" tabindex="-1">Above VWAP &middot; Rising <span class="count">%%RISING%%</span></button>
+      <button class="tab" role="tab" id="tab-signals" aria-controls="panel-signals" aria-selected="false" tabindex="-1">Above VWAP Band <span class="count">%%COUNT%%</span></button>
+      <button class="tab" role="tab" id="tab-mtf" aria-controls="panel-mtf" aria-selected="false" tabindex="-1">Multi-Timeframe Rising <span class="count" id="mtf-count">%%MTF_ALL%%</span></button>
     </nav>
 
     <div>
       <section class="card panel" role="tabpanel" id="panel-flipped" aria-labelledby="tab-flipped">
         <div class="panel-head">
-          <h2>Flipped since listed</h2>
+          <h2>Bullish Re-entry</h2>
           <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
           <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
         </div>
@@ -878,7 +878,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 
       <section class="card panel" role="tabpanel" id="panel-rising" aria-labelledby="tab-rising" hidden>
         <div class="panel-head">
-          <h2>Over band &ndash; Increasing</h2>
+          <h2>Above VWAP &middot; Rising</h2>
           <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
           <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
         </div>
@@ -904,7 +904,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 
       <section class="card panel" role="tabpanel" id="panel-signals" aria-labelledby="tab-signals" hidden>
         <div class="panel-head">
-          <h2>Over VWAP band</h2>
+          <h2>Above VWAP Band</h2>
           <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
           <label class="toggle"><input type="checkbox" class="fresh-only"> New (%%FRESH%%)</label>
           <div class="legend"><span><i style="color:var(--series);border-top-style:dashed"></i>Supertrend</span><span><i style="color:var(--band)"></i>VWAP band</span></div>
@@ -928,7 +928,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
 
       <section class="card panel" role="tabpanel" id="panel-mtf" aria-labelledby="tab-mtf" hidden>
         <div class="panel-head">
-          <h2>D &middot; W &middot; M increasing</h2>
+          <h2>Multi-Timeframe Rising</h2>
           <input type="search" class="search" placeholder="Search" aria-label="Search symbol or company">
           <fieldset class="tf-filter">
             <legend>Rising on</legend>
@@ -1443,7 +1443,7 @@ def backfill(files: list[Path], days: int, args: argparse.Namespace) -> None:
     print(f"Backfilled {len(filled)} trading days ({trading_days[0]} to {trading_days[-1]}) -> {args.signals_file}")
 
 
-ALERT_LISTS = {"flipped": "Flipped since listed", "dwm": "D · W · M increasing"}
+ALERT_LISTS = {"flipped": "Bullish Re-entry", "dwm": "Multi-Timeframe Rising", "above": "Above VWAP Band"}
 
 
 def update_alerts(
@@ -1457,7 +1457,11 @@ def update_alerts(
     state_path.write_text(json.dumps({"as_of": as_of, "lists": lists}, indent=2) + "\n", encoding="utf-8")
     if previous is None:
         return {}  # first run: just record the baseline
-    new = {key: [s for s in syms if s not in previous["lists"].get(key, [])] for key, syms in lists.items()}
+    # A list missing from the saved state (e.g. newly added to alerts) only records its baseline.
+    new = {
+        key: [s for s in syms if s not in previous["lists"][key]] if key in previous["lists"] else []
+        for key, syms in lists.items()
+    }
     if not alert_path or not any(new.values()):
         return new
 
@@ -1506,7 +1510,7 @@ def main() -> int:
     parser.add_argument(
         "--alert-file",
         type=Path,
-        help="write a Markdown alert here when stocks newly join Flipped since listed or D · W · M increasing",
+        help="write a Markdown alert here when stocks newly join Bullish Re-entry, Multi-Timeframe Rising or Above VWAP Band",
     )
     parser.add_argument(
         "--backfill",
@@ -1564,6 +1568,7 @@ def main() -> int:
     lists = {
         "flipped": sorted(f.signal.symbol for f in flipped),
         "dwm": [m.symbol for m in mtfs if all(v.rising for v in m.steps.values())],
+        "above": sorted(s.symbol for s in signals),
     }
     new = update_alerts(
         lists, args.data_dir / "alerts_state.json", args.alert_file, details, companies, as_of
