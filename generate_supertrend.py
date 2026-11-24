@@ -221,7 +221,7 @@ def sma_stats(close: pd.Series, periods: tuple[int, ...]) -> tuple[dict[int, flo
 
 
 # SMA pairs checked for alignment (fast above slow) by the "SMA Gaining" tab.
-SMA_PAIRS = ((3, 9), (9, 20))
+SMA_PAIRS = ((3, 9), (9, 20), (20, 50), (50, 100), (100, 200))
 
 
 @dataclass
@@ -926,7 +926,7 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
     <button class="kpi" data-tab="sma">
       <div class="kpi-label">SMA Gaining</div>
       <div class="kpi-value">%%SMA_ALL%%</div>
-      <div class="kpi-foot">All gaining, SMA 3 &gt; 9 &gt; 20</div>
+      <div class="kpi-foot">All gaining &amp; stacked 3 &gt; &hellip; &gt; 200</div>
     </button>
   </section>
 
@@ -1065,6 +1065,9 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
             <legend>Aligned</legend>
             <label><input type="checkbox" class="tf-check" value="a3_9" checked> SMA 3 &gt; SMA 9</label>
             <label><input type="checkbox" class="tf-check" value="a9_20" checked> SMA 9 &gt; SMA 20</label>
+            <label><input type="checkbox" class="tf-check" value="a20_50" checked> SMA 20 &gt; SMA 50</label>
+            <label><input type="checkbox" class="tf-check" value="a50_100" checked> SMA 50 &gt; SMA 100</label>
+            <label><input type="checkbox" class="tf-check" value="a100_200" checked> SMA 100 &gt; SMA 200</label>
           </fieldset>
         </div>
         <div class="table-wrap">
@@ -1081,6 +1084,9 @@ dialog.detail::backdrop { background: rgba(0,0,0,.55); }
               <th class="num" data-type="num" title="SMA 200 of Heikin Ashi close vs previous day">SMA 200</th>
               <th class="num" data-type="num" title="How far SMA 3 is above (+) or below (-) SMA 9">3 &gt; 9</th>
               <th class="num" data-type="num" title="How far SMA 9 is above (+) or below (-) SMA 20">9 &gt; 20</th>
+              <th class="num" data-type="num" title="How far SMA 20 is above (+) or below (-) SMA 50">20 &gt; 50</th>
+              <th class="num" data-type="num" title="How far SMA 50 is above (+) or below (-) SMA 100">50 &gt; 100</th>
+              <th class="num" data-type="num" title="How far SMA 100 is above (+) or below (-) SMA 200">100 &gt; 200</th>
             </tr></thead>
             <tbody>
 %%SMA_ROWS%%
@@ -1817,7 +1823,7 @@ def main() -> int:
         "flipped": sorted(f.signal.symbol for f in flipped),
         "dwm": [m.symbol for m in mtfs if all(v.rising for v in m.steps.values())],
         "above": sorted(s.symbol for s in signals),
-        # SMA Gaining with its default filters: all six SMAs gaining and SMA 3 > 9 > 20.
+        # SMA Gaining with its default filters: all six SMAs gaining and stacked 3 > 9 > 20 > 50 > 100 > 200.
         "sma": [m.symbol for m in smas if all(m.sma_conditions.values())],
     }
     new = update_alerts(
