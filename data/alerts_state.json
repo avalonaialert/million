@@ -43,6 +43,7 @@
       "FAST",
       "FDS",
       "GILD",
+      "GWW",
       "HAS",
       "HLT",
       "KO",
@@ -66,7 +67,6 @@
       "SWK",
       "TGT",
       "TRV",
-      "TYL",
       "V",
       "VLTO",
       "VTRS",
@@ -77,15 +77,20 @@
     "sma": [
       "BIIB",
       "DGX",
+      "DRI",
       "GILD",
+      "LH",
       "MAS",
       "MRSH",
+      "PG",
+      "TECH",
       "TGT",
       "VRSN",
       "WRB",
       "ZBH"
     ],
     "rsi": [
+      "BIIB",
       "DGX"
     ]
   }
