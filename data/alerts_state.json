@@ -1,10 +1,10 @@
 {
-  "as_of": "2026-11-24",
+  "as_of": "2026-11-25",
   "lists": {
     "flipped": [
       "AIZ",
       "DGX",
-      "LH",
+      "OMC",
       "TGT"
     ],
     "dwm": [
@@ -12,8 +12,8 @@
       "BIIB",
       "DGX",
       "GILD",
-      "LH",
-      "TGT"
+      "TGT",
+      "VRSN"
     ],
     "above": [
       "A",
@@ -32,19 +32,18 @@
       "CB",
       "CBOE",
       "CHD",
-      "CINF",
       "COST",
       "CPAY",
       "CRL",
       "CTAS",
       "DGX",
+      "DIS",
       "EG",
       "EW",
       "FAST",
       "FDS",
       "GILD",
       "GWW",
-      "HAS",
       "HLT",
       "KO",
       "LH",
@@ -71,27 +70,37 @@
       "VLTO",
       "VTRS",
       "WAT",
-      "WRB",
-      "WST"
+      "WRB"
     ],
     "sma": [
+      "AIZ",
+      "AJG",
+      "AWK",
+      "BDX",
       "BIIB",
       "DGX",
+      "DIS",
+      "DLTR",
       "DRI",
+      "EG",
       "GILD",
-      "LH",
+      "JKHY",
       "MAS",
       "MRSH",
+      "MSI",
       "PG",
-      "TECH",
+      "PGR",
+      "REGN",
       "TGT",
+      "VLTO",
       "VRSN",
       "WRB",
       "ZBH"
     ],
     "rsi": [
       "BIIB",
-      "DGX"
+      "DGX",
+      "GILD"
     ]
   }
 }
